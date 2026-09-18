@@ -10933,37 +10933,31 @@ function SpawnPet_RefillReleasedHotbarSlots(releasedSlots, excludedTools)
 	end
 end
 
+function SendGiftCompose_RandomizeInventoryOrder()
+	-- Reorder ONLY the tracking array used to render Your Inventory.
+	-- No Tool is destroyed, moved, rebound, unbound, or otherwise mutated.
+	local tools = SpawnPetState.SpawnedTools
+	if type(tools) ~= "table" or #tools < 2 then return end
+
+	local rng = Random.new()
+	for i = #tools, 2, -1 do
+		local j = rng:NextInteger(1, i)
+		tools[i], tools[j] = tools[j], tools[i]
+	end
+end
+
 function SendGiftCompose_ConsumeSelectedPets()
-	-- ABSOLUTE SEND INVENTORY SAFETY:
-	-- Pressing SEND must NEVER remove, destroy, move, unbind, rebind, or otherwise
-	-- mutate ANY spawned pet, including pets currently in the hotbar AND pets
-	-- stored below/outside the hotbar (virtual inventory / Backpack overflow).
-	-- SEND is visual-only in this script: the selected pets are captured for the
-	-- confirmation screen, while every original Tool remains exactly where it was.
-	-- This function therefore intentionally performs NO pet consumption at all.
+	-- ABSOLUTE SEND SAFETY:
+	-- Pressing Send must never delete, move, destroy, unbind, or replace ANY pet.
+	-- Selected pets are already captured visually before this function runs.
+	-- The send flow is presentation-only for this client-side virtual inventory.
 
-	local selected = {}
-	for _, tool in ipairs(SendGiftCompose_SelectedTools or {}) do
-		if tool then
-			selected[tool] = true
-		end
-	end
-
-	-- Keep every tracked spawned Tool unchanged. Rebuild only to remove any stale
-	-- nil references; no live Tool is destroyed or re-parented.
-	local kept = {}
-	for _, tool in ipairs(SpawnPetState.SpawnedTools or {}) do
-		if tool then
-			table.insert(kept, tool)
-		end
-	end
-	SpawnPetState.SpawnedTools = kept
-
-	-- Do not touch ToolToClone, ToolToSlot, HotbarBindings, HotbarOriginals,
-	-- slot attributes, Character, or Backpack here.
-	-- The selected list is cleared only so the compose UI can reset; the pets
-	-- themselves remain fully intact and usable after SEND.
 	SendGiftCompose_SelectedTools = {}
+
+	-- After Send, randomize the order of ALL remaining inventory pets so the
+	-- Your Inventory cards appear in a different random order next time they refresh.
+	SendGiftCompose_RandomizeInventoryOrder()
+
 	pcall(function() SendGiftCompose_RefreshSelectedPets() end)
 	pcall(function() SendGiftCompose_RefreshInventory() end)
 end
