@@ -10934,60 +10934,35 @@ function SpawnPet_RefillReleasedHotbarSlots(releasedSlots, excludedTools)
 end
 
 function SendGiftCompose_ConsumeSelectedPets()
-	-- HOTBAR SAFETY RULE:
-	-- A pet that is currently assigned to a real hotbar slot is NEVER moved,
-	-- re-bound, unbound, destroyed, or otherwise modified by Send.
-	-- Sending that pet only captures its visual for the confirmation screen.
-	-- Only pets that are NOT assigned to a hotbar slot are consumed.
-	local hotbarSelected = {}
-	local inventorySelected = {}
+	-- ABSOLUTE SEND INVENTORY SAFETY:
+	-- Pressing SEND must NEVER remove, destroy, move, unbind, rebind, or otherwise
+	-- mutate ANY spawned pet, including pets currently in the hotbar AND pets
+	-- stored below/outside the hotbar (virtual inventory / Backpack overflow).
+	-- SEND is visual-only in this script: the selected pets are captured for the
+	-- confirmation screen, while every original Tool remains exactly where it was.
+	-- This function therefore intentionally performs NO pet consumption at all.
 
+	local selected = {}
 	for _, tool in ipairs(SendGiftCompose_SelectedTools or {}) do
 		if tool then
-			local slot = SpawnPetState.ToolToSlot and SpawnPetState.ToolToSlot[tool]
-			if slot and slot.Parent and slot:GetAttribute('__SpawnPetOccupied') == true then
-				hotbarSelected[tool] = true
-			else
-				inventorySelected[tool] = true
-			end
+			selected[tool] = true
 		end
 	end
 
-	-- Consume ONLY hidden/inventory-only pets.
-	for tool in pairs(inventorySelected) do
-		if tool then
-			local clone = SpawnPetState.ToolToClone and SpawnPetState.ToolToClone[tool]
-			if clone and SpawnPetState.AnimationTrackByClone then
-				local track = SpawnPetState.AnimationTrackByClone[clone]
-				if track then
-					pcall(function() track:Stop(0) end)
-				end
-				SpawnPetState.AnimationTrackByClone[clone] = nil
-			end
-
-			if SpawnPetState.ToolToClone then
-				SpawnPetState.ToolToClone[tool] = nil
-			end
-			if SpawnPetState.ToolToSlot then
-				SpawnPetState.ToolToSlot[tool] = nil
-			end
-			pcall(function() tool:Destroy() end)
-		end
-	end
-
-	-- Rebuild SpawnedTools, keeping ALL hotbar pets untouched and removing only
-	-- the inventory-only pets that were actually selected for Send.
+	-- Keep every tracked spawned Tool unchanged. Rebuild only to remove any stale
+	-- nil references; no live Tool is destroyed or re-parented.
 	local kept = {}
 	for _, tool in ipairs(SpawnPetState.SpawnedTools or {}) do
-		if tool and (not inventorySelected[tool] or hotbarSelected[tool]) then
+		if tool then
 			table.insert(kept, tool)
 		end
 	end
 	SpawnPetState.SpawnedTools = kept
 
-	-- Nothing in the hotbar is rebound, released, replaced, or restored here.
-	-- This intentionally leaves every selected hotbar slot exactly as it was
-	-- before Send was pressed.
+	-- Do not touch ToolToClone, ToolToSlot, HotbarBindings, HotbarOriginals,
+	-- slot attributes, Character, or Backpack here.
+	-- The selected list is cleared only so the compose UI can reset; the pets
+	-- themselves remain fully intact and usable after SEND.
 	SendGiftCompose_SelectedTools = {}
 	pcall(function() SendGiftCompose_RefreshSelectedPets() end)
 	pcall(function() SendGiftCompose_RefreshInventory() end)
