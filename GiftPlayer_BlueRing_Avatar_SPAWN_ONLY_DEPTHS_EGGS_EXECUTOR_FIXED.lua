@@ -1,3 +1,7 @@
+-- SpawnPet v34.9: client-only pets + exact real Hotbar mutation compositor + persistent every-slot repair
+-- PETBASE v25: exact game AssetComponent + AssetBillboardController + AssetMovementBatch
+-- Built from v23; replaces custom random Heartbeat wandering with the live game controller stack.
+-- Source basis: supplied runtime capture + decompile report for ActiveAssetsController, AssetComponent, AssetBillboardController, AssetWanderSimulator and AssetMovementBatch.
 -- ==========================================
 -- CONFIG & SETTINGS
 -- ==========================================
@@ -75,6 +79,12 @@ UserInputService = game:GetService("UserInputService")
 RunService = game:GetService("RunService")
 TweenService = game:GetService("TweenService")
 ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+-- EXACT GAME ICON RENDERER (source-confirmed from client)
+local AssetIconShape = nil
+pcall(function()
+	AssetIconShape = require(ReplicatedStorage.Client.UI.AssetIconShape)
+end)
 Workspace = game:GetService("Workspace")
 ContentProvider = game:GetService("ContentProvider")
 TextService = game:GetService("TextService")
@@ -443,6 +453,25 @@ Instance.new(
 	ForceTestBtn
 ).CornerRadius =
 	UDim.new(0, 4)
+
+-- ==========================================
+-- SELL PET CONTROL
+-- ==========================================
+SellPetBtn = Instance.new("TextButton", ControlPanel)
+SellPetBtn.Name = "SellPetBtn"
+SellPetBtn.Size = UDim2.new(1, 0, 0, 36)
+SellPetBtn.BackgroundColor3 = Color3.fromRGB(118, 255, 10)
+SellPetBtn.BorderSizePixel = 0
+SellPetBtn.Text = "SELL PET"
+SellPetBtn.TextColor3 = Color3.fromRGB(0, 0, 0)
+SellPetBtn.Font = Enum.Font.GothamBold
+SellPetBtn.TextSize = 13
+SellPetBtn.AutoButtonColor = true
+SellPetBtn.LayoutOrder = 1
+Instance.new("UICorner", SellPetBtn).CornerRadius = UDim.new(0, 7)
+SellPetBtnStroke = Instance.new("UIStroke", SellPetBtn)
+SellPetBtnStroke.Color = Color3.fromRGB(255, 255, 255)
+SellPetBtnStroke.Thickness = 1
 
 -- ==========================================
 -- BADGE CONTROL
@@ -1413,6 +1442,7 @@ end)
 
 -- ==========================================
 -- SPAWN PET TAB (integrated from script111)
+-- After SPAWN, the resulting VirtualPet is directly placeable: equip it and click inside the base.
 -- ==========================================
 -- This module intentionally uses one shared state table so it does not add
 -- many top-level local registers to the host script.
@@ -1435,13 +1465,52 @@ SpawnPetState.Meta.earningRate = tonumber(SpawnPetState.Meta.earningRate) or 0
 SpawnPetState.Meta.perSecondValue = tonumber(SpawnPetState.Meta.perSecondValue) or 0
 SpawnPetState.Meta.rarityNumber = tonumber(SpawnPetState.Meta.rarityNumber) or 0
 SpawnPetState.SpawnedTools = SpawnPetState.SpawnedTools or {}
+SpawnPetState.ControlPanelVisualByTool = SpawnPetState.ControlPanelVisualByTool or setmetatable({}, {__mode="k"})
+SpawnPetState.ControlPanelVisualBySlot = SpawnPetState.ControlPanelVisualBySlot or {}
 SpawnPetState.HotbarBindings = SpawnPetState.HotbarBindings or {}
+SpawnPetState.RainbowHotbarRepair = SpawnPetState.RainbowHotbarRepair or {}
 SpawnPetState.HotbarOriginals = SpawnPetState.HotbarOriginals or {}
 SpawnPetState.AnimationTrackByClone = SpawnPetState.AnimationTrackByClone or {}
+SpawnPetState.HeldAnimationConnections = SpawnPetState.HeldAnimationConnections or setmetatable({}, {__mode="k"})
 SpawnPetState.ToolToClone = SpawnPetState.ToolToClone or {}
 SpawnPetState.ToolToSlot = SpawnPetState.ToolToSlot or {}
 SpawnPetState.AssetItemByClone = SpawnPetState.AssetItemByClone or setmetatable({}, {__mode="k"})
 SpawnPetState.SearchToken = 0
+SpawnPetState.SelectedMutation = SpawnPetState.SelectedMutation or ""
+SpawnPetState.MutationButtons = SpawnPetState.MutationButtons or {}
+SpawnPetState.PlacementInputConnection = SpawnPetState.PlacementInputConnection or nil
+SpawnPetState.MetaByTool = SpawnPetState.MetaByTool or setmetatable({}, {__mode="k"})
+SpawnPetState.MutationCatalog = SpawnPetState.MutationCatalog or nil
+SpawnPetState.SelectedMutations = SpawnPetState.SelectedMutations or {}
+SpawnPetState.ConfirmedMutations = SpawnPetState.ConfirmedMutations or {}
+
+-- v37: undo previous global AssetIconShape hooks from v36.x.
+-- Hotbar no longer needs to override game AssetIconShape.Strip/Paint because the
+-- final Control Panel icon is rendered as a top-level replica over the slot.
+pcall(function()
+	if AssetIconShape then
+		if SpawnPetState.OriginalAssetIconShapeStrip then
+			AssetIconShape.Strip = SpawnPetState.OriginalAssetIconShapeStrip
+		end
+		if SpawnPetState.OriginalAssetIconShapePaint then
+			AssetIconShape.Paint = SpawnPetState.OriginalAssetIconShapePaint
+		end
+		AssetIconShape.__SpawnPetExactMutationStripWrapped = nil
+		AssetIconShape.__SpawnPetExactMutationPaintWrapped = nil
+	end
+end)
+
+
+SpawnPetState.MutationIconCache = {}
+-- Live game Mutation visual templates, cached per mutation name.
+-- These contain only the real overlay tree (for example RainbowOverlayImage
+-- -> RarityGradient), never the source pet's base icon.
+SpawnPetState.MutationVisualTemplateCache = {}
+local function SpawnPet_V33Safe(fn, default)
+	local ok, value = pcall(fn)
+	if ok then return value end
+	return default
+end
 
 function SpawnPet_Normalize(value)
 	value = tostring(value or "")
@@ -2016,12 +2085,21 @@ function SpawnPet_BuildAuthoritativeAssetItem(sourceModel, meta, scaleOverride)
 	if not scale or scale <= 0 then scale = 1 end
 
 	local sourceMutations = SpawnPet_ReadSourcePetField(sourceModel, "Mutations", nil)
-	local mutations = SpawnPet_ParseMutationList(
-		sourceMutations ~= nil and sourceMutations or meta.mutations
-	)
+	local mutations
+	local baseMutation
 
-	local sourceBaseMutation = SpawnPet_ReadSourcePetField(sourceModel, "BaseMutation", nil)
-	local baseMutation = sourceBaseMutation ~= nil and sourceBaseMutation or meta.baseMutation
+	-- Explicit UI selection overrides the source pet mutation state.
+	-- Multiple selected mutation IDs are kept in one ordered list.
+	if meta.mutationOverride ~= nil then
+		mutations = SpawnPet_ParseMutationList(meta.mutationOverride)
+		baseMutation = (#mutations > 0 and mutations[1]) or nil
+	else
+		mutations = SpawnPet_ParseMutationList(
+			sourceMutations ~= nil and sourceMutations or meta.mutations
+		)
+		local sourceBaseMutation = SpawnPet_ReadSourcePetField(sourceModel, "BaseMutation", nil)
+		baseMutation = sourceBaseMutation ~= nil and sourceBaseMutation or meta.baseMutation
+	end
 
 	local creatorTemporary = SpawnPet_ReadSourcePetField(sourceModel, "CreatorTemporary", nil)
 	if type(creatorTemporary) ~= "boolean" then
@@ -2077,11 +2155,54 @@ function SpawnPet_BuildRealGameRig(assetItem)
 		return nil, "AssetRigFactory.Build-unavailable"
 	end
 
+	-- Traced live pipeline: Build(assetItem, true), then Mutations.ApplyTo.
 	local okBuild, model = pcall(function()
-		return AssetRigFactory.Build(assetItem)
+		return AssetRigFactory.Build(assetItem, true)
 	end)
 	if not okBuild or not model or not model:IsA("Model") then
+		okBuild, model = pcall(function()
+			return AssetRigFactory.Build(assetItem)
+		end)
+	end
+	if not okBuild or not model or not model:IsA("Model") then
 		return nil, "AssetRigFactory.Build-failed:" .. tostring(model)
+	end
+
+	local mutationList = {}
+	if type(assetItem.Mutations) == "table" then
+		for _, name in ipairs(assetItem.Mutations) do
+			local normalized = SpawnPet_Normalize(name)
+			if normalized ~= "" then
+				mutationList[#mutationList + 1] = normalized
+			end
+		end
+	elseif assetItem.BaseMutation ~= nil then
+		local normalized = SpawnPet_Normalize(assetItem.BaseMutation)
+		if normalized ~= "" then mutationList[1] = normalized end
+	end
+
+	if #mutationList > 0 then
+		local okMut, Mutations = pcall(function()
+			return require(ReplicatedStorage.Shared.Modules.Mutations)
+		end)
+		if okMut and type(Mutations) == "table" and type(Mutations.ApplyTo) == "function" then
+			local seed = tonumber(assetItem.ColorSeed)
+			if not seed then
+				seed = math.random(1, 2147483646)
+				assetItem.ColorSeed = seed
+			end
+
+			for _, mutation in ipairs(mutationList) do
+				-- Apply in the same order selected by the UI. The live API is singular,
+				-- while EarningsFor/AssetItem retain the complete mutation list.
+				pcall(function()
+					Mutations.ApplyTo(model, mutation, seed)
+				end)
+			end
+			pcall(function()
+				model:SetAttribute("AppliedMutations", table.concat(mutationList, ", "))
+			end)
+		end
 	end
 
 	return model, "AssetRigFactory.Build"
@@ -2311,34 +2432,560 @@ function SpawnPet_ApplyAuthoritativePetData(sourceModel, meta, scaleOverride)
 	return meta
 end
 
-function SpawnPet_GetReal2DIcon(name)
-	-- The Assets Directory lookup is intentionally FIRST and authoritative.
-	local exactAssetsIcon = SpawnPet_GetAssetsDirectoryIcon(name)
-	if exactAssetsIcon ~= "" then
-		return exactAssetsIcon
+function SpawnPet_AddMutationName(list, seen, value)
+	value = SpawnPet_Normalize(value)
+	if value == "" then return end
+	if string.lower(value) == "none" then return end
+	local key = string.lower(value)
+	if seen[key] then return end
+	seen[key] = true
+	list[#list + 1] = value
+end
+
+function SpawnPet_ReadMutationCatalog()
+	local list = {}
+	local seen = {}
+	local function consume(value)
+		if type(value) ~= "table" then
+			if type(value) == "string" then
+				SpawnPet_AddMutationName(list, seen, value)
+			end
+			return
+		end
+
+		for k, v in pairs(value) do
+			if type(v) == "string" then
+				SpawnPet_AddMutationName(list, seen, v)
+			elseif type(k) == "string" then
+				-- IdSet is commonly a string-keyed set; dictionary keys can be IDs.
+				SpawnPet_AddMutationName(list, seen, k)
+			elseif type(v) == "table" then
+				consume(v)
+			end
+		end
 	end
 
-	-- Legacy runtime fallbacks are kept only when Directory.<Pet>.Icon does not
-	-- exist, so the new exact source can never be overwritten by another icon.
-	local wanted = string.lower(SpawnPet_Normalize(name))
-	local hotbar = SpawnPet_FindHotbar()
-	if hotbar then
-		for _, slot in ipairs(hotbar:GetChildren()) do
-			local tip = SpawnPet_GetSlotPetText(slot)
-			if tip ~= "" then
-				local petText = string.lower(SpawnPet_Normalize(string.match(tip, "^[^|]+") or tip))
-				if petText == wanted then
-					local icon = slot:FindFirstChild("Icon", true)
-					if icon and (icon:IsA("ImageLabel") or icon:IsA("ImageButton")) then
-						local id = SpawnPet_AssetId(icon.Image)
-						if id then return "rbxassetid://" .. id end
-					end
+	local ok, Mutations = pcall(function()
+		return require(ReplicatedStorage.Shared.Modules.Mutations)
+	end)
+
+	if ok and type(Mutations) == "table" then
+		if type(Mutations.Ids) == "function" then
+			pcall(function() consume(Mutations.Ids()) end)
+		end
+		if type(Mutations.All) == "function" then
+			pcall(function() consume(Mutations.All()) end)
+		end
+		if type(Mutations.IdSet) == "table" then
+			consume(Mutations.IdSet)
+		end
+
+		-- Keep only IDs the live module itself recognizes. This prevents metadata
+		-- keys from an All()/IdSet table from appearing as fake mutations.
+		if type(Mutations.IsKnown) == "function" then
+			local knownOnly = {}
+			for _, name in ipairs(list) do
+				local okKnown, known = pcall(function()
+					return Mutations.IsKnown(name)
+				end)
+				if okKnown and known == true then
+					knownOnly[#knownOnly + 1] = name
+				end
+			end
+			list = knownOnly
+		end
+	end
+
+	-- These three are directly confirmed by the runtime trace.
+	for _, name in ipairs({"Golden","Rainbow","Silver"}) do
+		SpawnPet_AddMutationName(list, seen, name)
+	end
+
+	table.sort(list, function(a, b)
+		return string.lower(a) < string.lower(b)
+	end)
+
+	table.insert(list, 1, "None")
+	SpawnPetState.MutationCatalog = list
+	return list
+end
+
+function SpawnPet_GetSelectedMutationList()
+	local result = {}
+	local catalog = SpawnPetState.MutationCatalog or SpawnPet_ReadMutationCatalog()
+	local selected = SpawnPetState.SelectedMutations or {}
+
+	for _, name in ipairs(catalog) do
+		if name ~= "None" and selected[string.lower(name)] == true then
+			result[#result + 1] = name
+		end
+	end
+	return result
+end
+
+function SpawnPet_GetConfirmedMutationList()
+	local result = {}
+	local catalog = SpawnPetState.MutationCatalog or SpawnPet_ReadMutationCatalog()
+	local confirmed = SpawnPetState.ConfirmedMutations or {}
+
+	for _, name in ipairs(catalog) do
+		if name ~= "None" and confirmed[string.lower(name)] == true then
+			result[#result + 1] = name
+		end
+	end
+	return result
+end
+
+function SpawnPet_GetSelectedMutationText()
+	local list = SpawnPet_GetSelectedMutationList()
+	if #list == 0 then return "None" end
+	return table.concat(list, " + ")
+end
+
+function SpawnPet_V35FindRealColorSeed(petName, mutation)
+	local wantedPet = SpawnPet_V33Token(petName)
+	local wantedMutation = SpawnPet_V33Token(mutation)
+	if wantedPet == "" or wantedMutation == "" then return nil end
+	local function scan(container)
+		if not container then return nil end
+		for _, tool in ipairs(container:GetChildren()) do
+			if tool:IsA("Tool") then
+				local n = SpawnPet_V33Token(tool:GetAttribute("DisplayName") or tool.Name)
+				local base = SpawnPet_V33Token(tool:GetAttribute("BaseMutation") or "")
+				local muts = SpawnPet_V33Token(tool:GetAttribute("Mutations") or "")
+				if n:find(wantedPet,1,true) and (base:find(wantedMutation,1,true) or muts:find(wantedMutation,1,true)) then
+					local seed = tonumber(tool:GetAttribute("ColorSeed"))
+					if seed then return seed end
 				end
 			end
 		end
 	end
-	return ""
+	return nil
 end
+
+function SpawnPet_ApplyMutationSelection(meta)
+	meta = meta or {}
+
+	local list = SpawnPet_GetConfirmedMutationList()
+	local override = table.concat(list, ",")
+	meta.mutationOverride = override
+
+	if #list == 0 then
+		meta.mutations = {}
+		meta.baseMutation = nil
+		return meta
+	end
+
+	meta.mutations = {}
+	for _, mutation in ipairs(list) do
+		meta.mutations[#meta.mutations + 1] = mutation
+	end
+	meta.baseMutation = list[1]
+
+	if not tonumber(meta.colorSeed) then
+		local realSeed = nil
+		pcall(function()
+			realSeed = SpawnPet_V35FindRealColorSeed(meta.name, list[1])
+		end)
+		if tonumber(realSeed) then
+			meta.colorSeed = realSeed
+		else
+			local seedSource = tostring(Player.UserId) .. ":" .. tostring(meta.name or "Pet") .. ":" .. override
+			local hash = 0
+			for i = 1, #seedSource do
+				hash = (hash * 33 + string.byte(seedSource, i)) % 2147483646
+			end
+			meta.colorSeed = math.max(hash, 1)
+		end
+	end
+
+	return meta
+end
+
+function SpawnPet_SetSelectedMutation(name, forceValue)
+	local normalized = SpawnPet_Normalize(name)
+	if string.lower(normalized) == "none" then
+		SpawnPetState.SelectedMutations = {}
+	elseif normalized ~= "" then
+		local key = string.lower(normalized)
+		SpawnPetState.SelectedMutations[key] =
+			(forceValue == nil) and not (SpawnPetState.SelectedMutations[key] == true) or (forceValue == true)
+	end
+
+	-- Refresh button states only. Searching/loading the pet and resolving its
+	-- icon is intentionally deferred until CONFIRM / FIND PET is pressed.
+	for mutationName, button in pairs(SpawnPetState.MutationButtons or {}) do
+		if button and button.Parent then
+			local active
+			if string.lower(mutationName) == "none" then
+				active = (#SpawnPet_GetSelectedMutationList() == 0)
+			else
+				active = SpawnPetState.SelectedMutations[string.lower(mutationName)] == true
+			end
+			button.BackgroundColor3 = active and Color3.fromRGB(118,255,10) or Color3.fromRGB(55,57,66)
+			button.TextColor3 = active and Color3.fromRGB(0,0,0) or Color3.fromRGB(255,255,255)
+			button.Text = active and ("✓ " .. mutationName) or mutationName
+		end
+	end
+
+	if SpawnPetState.MutationSelectionLabel then
+		SpawnPetState.MutationSelectionLabel.Text = "Selected: " .. SpawnPet_GetSelectedMutationText()
+	end
+
+	if SpawnPetState.Status then
+		local pending = SpawnPet_GetSelectedMutationText()
+		SpawnPetState.Status.Text = "Pending: " .. pending .. " • Press CONFIRM / FIND PET"
+	end
+end
+
+function SpawnPet_ClearSelectedMutations()
+	SpawnPetState.SelectedMutations = {}
+	SpawnPetState.ConfirmedMutations = {}
+	SpawnPet_SetSelectedMutation("None", true)
+end
+
+function SpawnPet_V35NormalizeImageId(value)
+	local s = SpawnPet_Normalize(value)
+	local id = SpawnPet_AssetId(s)
+	return id and ("rbxassetid://" .. id) or s
+end
+
+function SpawnPet_V35GetDirectIcon(slot)
+	if not slot then return nil end
+	local icon = slot:FindFirstChild("Icon")
+	if icon and (icon:IsA("ImageLabel") or icon:IsA("ImageButton")) then
+		return icon
+	end
+	return nil
+end
+
+function SpawnPet_V35MutationAliases(mutation)
+	local token = SpawnPet_V33Token(mutation)
+	local aliases = {
+		rainbow = {"rainbowoverlayimage", "rainbowoverlay"},
+		golden = {"goldenoverlayimage", "goldenoverlay"},
+		silver = {"silveroverlayimage", "silveroverlay"},
+		void = {"voidoverlayimage", "voidoverlay"},
+		boss = {"bossoverlayimage", "bossoverlay"},
+		greatbloom = {"greatbloomoverlayimage", "greatbloomoverlay"},
+		monstrous = {"monstrousoverlayimage", "monstrousoverlay"},
+		sakura = {"sakuraoverlayimage", "sakuraoverlay"},
+		scrambled = {"scrambledoverlayimage", "scrambledoverlay"},
+	}
+	return aliases[token] or {token}
+end
+
+function SpawnPet_V35FindMutationRoot(icon, mutation)
+	if not icon then return nil end
+	for _, child in ipairs(icon:GetChildren()) do
+		local n = SpawnPet_V33Token(child.Name)
+		for _, alias in ipairs(SpawnPet_V35MutationAliases(mutation)) do
+			if n == alias or string.find(n, alias, 1, true) then
+				return child
+			end
+		end
+	end
+	return nil
+end
+
+-- ============================================================
+-- v34.9: REAL HOTBAR MUTATION SOURCE + CLIENT-ONLY SIBLING COMPOSITE ICON
+-- ============================================================
+-- IMPORTANT: the real game does NOT use a separate "Rainbow image asset".
+-- The observed Rainbow icon is a COMPOSITE UI tree:
+--
+--   Hotbar.<slot>.Icon
+--      Image = <that pet's normal icon>
+--      RainbowOverlayImage
+--          Image = <same pet icon image>
+--          ImageTransparency = 0.5
+--          ZIndex = Icon.ZIndex + 1
+--          RarityGradient
+--              Color = the live Rainbow ColorSequence
+--              Transparency = the live Transparency sequence
+--              Rotation = -35
+--
+-- Therefore the correct method is:
+--   1) use the selected pet's Directory icon as the base Image;
+--   2) capture ONLY the mutation visual tree from ANY REAL Hotbar slot
+--      that currently has the requested mutation;
+--   3) retarget the overlay Image to the selected pet's base icon;
+--   4) keep the real game's gradient/settings intact;
+--   5) cache the captured tree so every subsequently spawned client-only pet
+--      receives the same mutation visual even after the original source slot
+--      is overwritten by another spawned pet.
+--
+-- We intentionally do NOT inspect Inventory/Backpack/Character here.  The
+-- user requested the Hotbar as the source of the real icon visual only.
+
+SpawnPet_V35HotbarMutationVisualCache = SpawnPet_V35HotbarMutationVisualCache or {}
+
+local function SpawnPet_V35CloneGuiTree(root)
+	if not root then return nil end
+	local clone
+	local ok = pcall(function() clone = root:Clone() end)
+	if ok and clone then return clone end
+	return nil
+end
+
+local function SpawnPet_V35HasLiveMutationVisual(icon, mutation)
+	if not icon then return false end
+	return SpawnPet_V35FindMutationRoot(icon, mutation) ~= nil
+end
+
+function SpawnPet_V35FindRealHotbarMutationIcon(name, mutation)
+	local hotbar = SpawnPet_FindHotbar()
+	if not hotbar then
+		return nil, false, "no-hotbar"
+	end
+
+	local targetBase = SpawnPet_V35NormalizeImageId(SpawnPet_GetAssetsDirectoryIcon(name))
+	local exact = nil
+	local fallback = nil
+
+	for _, slot in ipairs(hotbar:GetChildren()) do
+		local icon = SpawnPet_V35GetDirectIcon(slot)
+		if icon and SpawnPet_V35HasLiveMutationVisual(icon, mutation) then
+			local image = SpawnPet_V35NormalizeImageId(icon.Image)
+
+			-- Exact Pet + Mutation source. This is the strongest source because
+			-- it proves both the base pet image and the requested mutation belong
+			-- to the same real slot.
+			if targetBase ~= "" and image == targetBase then
+				exact = {icon = icon, slot = slot}
+				break
+			end
+
+			-- Otherwise remember ANY real mutation source. The target pet's own
+			-- base image will be put into the overlay later.
+			fallback = fallback or {icon = icon, slot = slot}
+		end
+	end
+
+	local found = exact or fallback
+	if found then
+		return found.icon, exact ~= nil, found.slot:GetFullName()
+	end
+
+	return nil, false, "no-real-mutation-icon"
+end
+
+function SpawnPet_V35CaptureHotbarMutationVisual(mutation)
+	local key = SpawnPet_V33Token(mutation)
+	if key == "" then return nil, "empty-mutation" end
+
+	SpawnPetState.MutationVisualTemplateCache = SpawnPetState.MutationVisualTemplateCache or {}
+	local cached = SpawnPetState.MutationVisualTemplateCache[key]
+	if cached and cached.template then
+		return cached, "cache:" .. key
+	end
+
+	-- IMPORTANT: Never use mutation text as the primary detector.
+	-- A real Hotbar slot can contain only Number text while Icon itself carries
+	-- the mutation visual tree. Scan every real Hotbar Icon structurally.
+	local hotbar = SpawnPet_FindHotbar()
+	if not hotbar then return nil, "no-hotbar" end
+
+	local bestRoot, bestIcon, bestSlot, bestScore
+	bestScore = -math.huge
+
+	for _, slot in ipairs(hotbar:GetChildren()) do
+		local icon = SpawnPet_V35GetDirectIcon(slot)
+		if icon then
+			local root = SpawnPet_V35FindMutationRoot(icon, mutation)
+			if root then
+				local score = 100
+				local wanted = SpawnPet_V33Token(mutation)
+				local rn = SpawnPet_V33Token(root.Name)
+				if rn == wanted .. "overlayimage" then score += 100 end
+				if rn == wanted .. "overlay" then score += 90 end
+				if root:FindFirstChild("RarityGradient", true) then score += 100 end
+				if icon:FindFirstChild("RarityGradient", true) then score += 20 end
+				if slot.Visible then score += 10 end
+				if score > bestScore then
+					bestScore = score
+					bestRoot = root
+					bestIcon = icon
+					bestSlot = slot
+				end
+			end
+		end
+	end
+
+	if not bestRoot then
+		return nil, "no-live-source:" .. key
+	end
+
+	local template = SpawnPet_V35CloneGuiTree(bestRoot)
+	if not template then
+		return nil, "clone-failed:" .. tostring(bestSlot)
+	end
+
+	SpawnPetState.MutationVisualTemplateCache[key] = {
+		template = template,
+		sourcePath = bestRoot:GetFullName(),
+		sourceIcon = bestIcon:GetFullName(),
+		sourceSlot = bestSlot:GetFullName(),
+	}
+	return SpawnPetState.MutationVisualTemplateCache[key], "captured:" .. bestRoot:GetFullName()
+end
+
+function SpawnPet_V35BuildRainbowFallback(baseIconId, sourceIcon)
+	-- The live scan established the game's exact Rainbow composition:
+	-- ImageLabel(Image = pet icon, Transparency=.5) + UIGradient(Rainbow).
+	-- This fallback is used ONLY when no live Rainbow source is currently
+	-- present in the Hotbar. It does not depend on a particular slot number.
+	if not baseIconId or SpawnPet_Normalize(baseIconId) == "" then
+		return nil, "no-base-icon"
+	end
+
+	local overlay = Instance.new("ImageLabel")
+	overlay.Name = "RainbowOverlayImage"
+	overlay.BackgroundTransparency = 1
+	overlay.BorderSizePixel = 0
+	overlay.Image = baseIconId
+	overlay.ImageColor3 = Color3.new(1, 1, 1)
+	overlay.ImageTransparency = 0.5
+	overlay.Size = sourceIcon and sourceIcon.Size or UDim2.fromScale(1, 1)
+	overlay.Position = sourceIcon and sourceIcon.Position or UDim2.fromScale(0, 0)
+	overlay.AnchorPoint = sourceIcon and sourceIcon.AnchorPoint or Vector2.zero
+	overlay.Rotation = sourceIcon and sourceIcon.Rotation or 0
+	overlay.ScaleType = sourceIcon and sourceIcon.ScaleType or Enum.ScaleType.Fit
+	overlay.ResampleMode = sourceIcon and sourceIcon.ResampleMode or Enum.ResamplerMode.Default
+	overlay.Visible = true
+
+	local gradient = Instance.new("UIGradient")
+	gradient.Name = "RarityGradient"
+	gradient.Color = ColorSequence.new({
+		ColorSequenceKeypoint.new(0.000, Color3.fromRGB(0,255,0)),
+		ColorSequenceKeypoint.new(0.143, Color3.fromRGB(127,255,0)),
+		ColorSequenceKeypoint.new(0.286, Color3.fromRGB(255,0,0)),
+		ColorSequenceKeypoint.new(0.429, Color3.fromRGB(0,255,0)),
+		ColorSequenceKeypoint.new(0.571, Color3.fromRGB(0,255,255)),
+		ColorSequenceKeypoint.new(0.714, Color3.fromRGB(0,0,255)),
+		ColorSequenceKeypoint.new(0.857, Color3.fromRGB(255,0,255)),
+		ColorSequenceKeypoint.new(1.000, Color3.fromRGB(255,255,0)),
+	})
+	gradient.Transparency = NumberSequence.new({
+		NumberSequenceKeypoint.new(0,0),
+		NumberSequenceKeypoint.new(1,0),
+	})
+	gradient.Rotation = -35
+	pcall(function() gradient:SetAttribute("__custom_rotation", -35) end)
+	gradient.Parent = overlay
+
+	return overlay, "rainbow-fallback-from-live-scan"
+end
+
+function SpawnPet_V35ConfigureMutationOverlay(overlay, slot, icon, baseIconId, mutation)
+	if not overlay then return false end
+	local wanted = SpawnPet_V33Token(mutation)
+
+	if overlay:IsA("ImageLabel") or overlay:IsA("ImageButton") then
+		pcall(function() overlay.Image = baseIconId end)
+		pcall(function() overlay.ImageColor3 = Color3.new(1,1,1) end)
+		if wanted == "rainbow" then
+			pcall(function() overlay.ImageTransparency = 0.5 end)
+		end
+	end
+
+	-- Render the overlay as a sibling of Icon, not as Icon's child.
+	-- The game's Hotbar renderer can rebuild Icon children; a sibling layer
+	-- avoids that cleanup while preserving the same visual composition.
+	if icon and icon:IsA("GuiObject") then
+		pcall(function() overlay.Position = icon.Position end)
+		pcall(function() overlay.Size = icon.Size end)
+		pcall(function() overlay.AnchorPoint = icon.AnchorPoint end)
+		pcall(function() overlay.Rotation = icon.Rotation end)
+	end
+
+	pcall(function() overlay.BackgroundTransparency = 1 end)
+	pcall(function() overlay.BorderSizePixel = 0 end)
+	pcall(function() overlay.Visible = true end)
+	pcall(function() overlay.Active = false end)
+	local z = (icon and tonumber(icon.ZIndex) or 20) + 1000
+	pcall(function() overlay.ZIndex = z end)
+
+	if overlay:IsA("ImageLabel") and wanted == "rainbow" then
+		local gradient = overlay:FindFirstChild("RarityGradient", true)
+		if gradient and gradient:IsA("UIGradient") then
+			pcall(function() gradient.Rotation = -35 end)
+			pcall(function() gradient.Enabled = true end)
+		end
+	end
+
+	if slot then
+		overlay.Parent = slot
+	end
+	return true
+end
+
+function SpawnPet_V35DestroyGeneratedMutationLayers(slot)
+	if not slot then return end
+	for _, child in ipairs(slot:GetChildren()) do
+		if string.sub(tostring(child.Name), 1, 27) == "__SpawnPetMutationVisual_" then
+			pcall(function() child:Destroy() end)
+		end
+	end
+end
+
+function SpawnPet_V35HasGeneratedMutationLayer(slot, mutation)
+	if not slot then return false end
+	local wanted = SpawnPet_V33Token(mutation)
+	local prefix = "__SpawnPetMutationVisual_" .. wanted
+	for _, child in ipairs(slot:GetChildren()) do
+		if tostring(child.Name) == prefix and child:IsA("GuiObject") and child.Visible then
+			if wanted ~= "rainbow" then return true end
+			local gradient = child:FindFirstChild("RarityGradient", true)
+			if gradient and gradient:IsA("UIGradient") then
+				return true
+			end
+		end
+	end
+	return false
+end
+
+function SpawnPet_GetReal2DIcon(name, mutation)
+	-- For string-only consumers, return the same Icon value selected by the
+	-- game's AssetIconShape.ResolveImages when we can construct the AssetItem.
+	-- Rainbow's second layer is created by AssetIconShape.Paint, not encoded in
+	-- the returned string.
+	local base = SpawnPet_GetAssetsDirectoryIcon(name) or ""
+	if type(AssetIconShape) ~= "table" or type(AssetIconShape.ResolveImages) ~= "function" then
+		return base
+	end
+
+	local tempMeta = {
+		name = tostring(name or ""),
+		category = tostring(name or ""),
+		scale = 1,
+		mutations = {},
+		baseMutation = nil,
+		mutationOverride = "",
+		hasBeenFirstPlaced = true,
+	}
+	if tostring(mutation or "") ~= "" and tostring(mutation) ~= "None" then
+		tempMeta.mutations = { tostring(mutation) }
+		tempMeta.baseMutation = tostring(mutation)
+		tempMeta.mutationOverride = tostring(mutation)
+	end
+
+	local ok, item = pcall(function()
+		return SpawnPet_BuildAuthoritativeAssetItem(nil, tempMeta, 1)
+	end)
+	if not ok or type(item) ~= "table" then
+		return base
+	end
+
+	local okResolved, resolved = pcall(function()
+		return AssetIconShape.ResolveImages(item)
+	end)
+	if okResolved and type(resolved) == "table" and tostring(resolved.Icon or "") ~= "" then
+		return tostring(resolved.Icon)
+	end
+	return base
+end
+
 
 -- Direct in-game rarity resolver. All rarity text/style comes from live game UI
 -- or ReplicatedStorage.Data.Rarity.Configs.<Rarity>; no hard-coded rarity colors.
@@ -3198,6 +3845,26 @@ function SpawnPet_EnsureAnimator(clone)
 end
 
 function SpawnPet_PlayAnimation1(clone, meta)
+	if not clone or not clone:IsA("Model") then return false end
+	meta = meta or {}
+	SpawnPetState.AnimationTrackByClone=SpawnPetState.AnimationTrackByClone or {}
+
+	-- Reuse the existing held-pet track when possible. v26 could leave the
+	-- previously loaded track stopped after ScaleTo/reparenting, so repeatedly
+	-- creating new tracks was unreliable. Restart the same track first.
+	local existing = SpawnPetState.AnimationTrackByClone[clone]
+	if existing then
+		local revived = pcall(function()
+			if not existing.IsPlaying then
+				existing.Looped=true
+				existing.Priority=Enum.AnimationPriority.Idle
+				existing:Play(0.08,1,1)
+			end
+		end)
+		if revived then return true end
+		SpawnPetState.AnimationTrackByClone[clone] = nil
+	end
+
 	local animator=SpawnPet_EnsureAnimator(clone)
 	if not animator then return false end
 	local id=SpawnPet_AssetId(meta.animationId)
@@ -3212,13 +3879,39 @@ function SpawnPet_PlayAnimation1(clone, meta)
 	end
 	if not id then return false end
 	local animation=sourceAnimation or Instance.new("Animation")
-	if not sourceAnimation then animation.Name="__SpawnPetAnimation1"; animation.AnimationId="rbxassetid://"..id; animation.Parent=clone end
+	if not sourceAnimation then
+		animation.Name="__SpawnPetAnimation1"
+		animation.AnimationId="rbxassetid://"..id
+		animation.Parent=clone
+	end
 	local ok, track=pcall(function() return animator:LoadAnimation(animation) end)
 	if not ok or not track then return false end
-	pcall(function() track.Looped=true; track.Priority=Enum.AnimationPriority.Idle; track:Play(0.08,1,1) end)
-	SpawnPetState.AnimationTrackByClone=SpawnPetState.AnimationTrackByClone or {}
+	local played = pcall(function()
+		track.Looped=true
+		track.Priority=Enum.AnimationPriority.Idle
+		track:Play(0.08,1,1)
+	end)
+	if not played then return false end
 	SpawnPetState.AnimationTrackByClone[clone]=track
 	return true
+end
+
+function SpawnPet_RestartHeldAnimation(tool, clone, meta)
+	if not tool or not clone or not clone:IsA("Model") then return end
+	if not clone:IsDescendantOf(tool) then return end
+
+	-- A Tool reparent/equip or Model:ScaleTo can stop an Animator track on some
+	-- clients. Restart it after the hierarchy/scale operation has settled.
+	task.defer(function()
+		if tool.Parent and clone.Parent and clone:IsDescendantOf(tool) then
+			SpawnPet_PlayAnimation1(clone, meta or {})
+		end
+	end)
+	task.delay(0.12, function()
+		if tool.Parent and clone.Parent and clone:IsDescendantOf(tool) then
+			SpawnPet_PlayAnimation1(clone, meta or {})
+		end
+	end)
 end
 
 function SpawnPet_PrepareHandPhysics(clone)
@@ -3237,6 +3930,85 @@ function SpawnPet_PrepareHandPhysics(clone)
 			pcall(function() obj.AutoRotate=false; obj.WalkSpeed=0; obj.JumpPower=0 end)
 		end
 	end
+end
+
+
+function SpawnPet_ApplyHeldFullDisplay(tool, clone, root, heightOverride)
+	if not tool or not clone or not clone:IsA("Model") or not root or not root:IsA("BasePart") then
+		return
+	end
+
+	-- Keep very small Tool previews renderable. This only protects the held
+	-- presentation path; the requested scale remains stored on the Tool.
+	local currentScale = nil
+	pcall(function() currentScale = clone:GetScale() end)
+	if not currentScale or currentScale <= 0 then currentScale = 1 end
+
+	-- Re-enable local visibility for client-held parts after ScaleTo / reparent.
+	for _, obj in ipairs(clone:GetDescendants()) do
+		if obj:IsA("BasePart") then
+			pcall(function()
+				obj.LocalTransparencyModifier = 0
+				obj.CanCollide = false
+				obj.CanTouch = false
+				obj.CanQuery = false
+				obj.Massless = true
+			end)
+		end
+	end
+
+	-- Make the hand connection use a small, scale-aware lift based on the
+	-- complete model bounds. This prevents ears/tails/wings from sitting inside
+	-- the character hand/body when the pet is reduced.
+	local bboxSize = Vector3.new(1, 1, 1)
+	pcall(function()
+		local _, size = clone:GetBoundingBox()
+		if size.X > 0 and size.Y > 0 and size.Z > 0 then
+			bboxSize = size
+		end
+	end)
+
+	local height = tonumber(heightOverride) or 0.5
+	local lift = math.clamp(bboxSize.Y * 0.10, 0.04, 0.90)
+
+	local handWeld = nil
+	if not handWeld then
+		local handle = tool:FindFirstChild("Handle")
+		if handle then
+			handWeld = handle:FindFirstChild("__SpawnPetHandWeld")
+		end
+	end
+
+	if handWeld and handWeld:IsA("Weld") then
+		handWeld.C0 = CFrame.new(0, lift, 0)
+		handWeld.C1 = CFrame.new()
+	end
+
+	-- Keep overhead UI readable even when the 3D pet itself is small. The
+	-- BillboardGui remains attached to the pet and is not allowed to be clipped
+	-- by its tiny world-space model dimensions.
+	for _, obj in ipairs(clone:GetDescendants()) do
+		if obj:IsA("BillboardGui") then
+			pcall(function()
+				obj.Enabled = true
+				obj.AlwaysOnTop = true
+				obj.MaxDistance = 1000
+				obj.ClipsDescendants = false
+			end)
+		end
+	end
+
+	local baseGrip = CFrame.new(0, height, 0)
+	pcall(function()
+		local realPose = SpawnPet_CaptureRealHandPose()
+		if realPose and realPose.grip then
+			baseGrip = realPose.grip * CFrame.new(0, height, 0)
+		end
+	end)
+
+	pcall(function() tool.Grip = baseGrip end)
+	tool:SetAttribute("HeldDisplayScale", currentScale)
+	tool:SetAttribute("HeldDisplayHeightOffset", height)
 end
 
 function SpawnPet_GetNumber(box, fallback)
@@ -3266,25 +4038,1732 @@ function SpawnPet_FindFreeHotbarSlot()
 	return nil
 end
 
+
+-- ============================================================
+-- v34.1: DYNAMIC MUTATION ICON LEARNING
+-- ============================================================
+-- The clean v4 scan showed that a real Rainbow hotbar slot can change:
+--   Icon.Image
+--   Icon.RainbowOverlayImage
+--   Icon.RainbowOverlayImage.RarityGradient
+-- Therefore a mutation cannot safely be represented by one hard-coded overlay.
+--
+-- v33 learns the exact visual from a REAL inventory/hotbar slot for the SAME
+-- pet + SAME mutation, caches that visual for this client session, then applies
+-- it to the SpawnPet slot.
+function SpawnPet_V33Token(value)
+	local s = string.lower(SpawnPet_Normalize(value))
+	s = string.gsub(s, "[^%w]", "")
+	return s
+end
+
+function SpawnPet_V33MutationList(meta)
+	local out, seen = {}, {}
+	local function add(v)
+		v = SpawnPet_Normalize(v)
+		if v == "" then return end
+		local key = SpawnPet_V33Token(v)
+		if key == "" or seen[key] then return end
+		seen[key] = true
+		out[#out + 1] = v
+	end
+	if meta then
+		if type(meta.mutations) == "table" then
+			for _, v in ipairs(meta.mutations) do add(v) end
+		end
+		add(meta.baseMutation)
+	end
+	return out
+end
+
+function SpawnPet_V33CollectText(root)
+	local result = {}
+	if not root then return "" end
+	result[#result+1] = SpawnPet_Normalize(root.Name)
+	for _, node in ipairs(root:GetDescendants()) do
+		if node:IsA("TextLabel") or node:IsA("TextButton") or node:IsA("TextBox") then
+			local t = SpawnPet_Normalize(node.Text)
+			if t ~= "" then result[#result+1] = t end
+		end
+	end
+	return table.concat(result, " | ")
+end
+
+function SpawnPet_V33ContainsToken(text, wanted)
+	local a = SpawnPet_V33Token(text)
+	local b = SpawnPet_V33Token(wanted)
+	return a ~= "" and b ~= "" and string.find(a, b, 1, true) ~= nil
+end
+
+function SpawnPet_V33MutationChild(node, mutations)
+	local n = SpawnPet_V33Token(node and node.Name or "")
+	if n == "" then return false end
+
+	for _, mutation in ipairs(mutations) do
+		local token = SpawnPet_V33Token(mutation)
+		if token ~= "" and string.find(n, token, 1, true) then
+			return true
+		end
+	end
+
+	for _, key in ipairs({
+		"mutation", "rainbowoverlay", "goldenoverlay", "silveroverlay",
+		"voidoverlay", "bossoverlay", "raritygradient"
+	}) do
+		if string.find(n, key, 1, true) then
+			return true
+		end
+	end
+	return false
+end
+
+function SpawnPet_V33CacheKey(meta)
+	local pet = SpawnPet_V33Token(meta and (meta.category or meta.name) or "")
+	local muts = {}
+	for _, mutation in ipairs(SpawnPet_V33MutationList(meta)) do
+		muts[#muts+1] = SpawnPet_V33Token(mutation)
+	end
+	table.sort(muts)
+	return pet .. "|" .. table.concat(muts, "+")
+end
+
+function SpawnPet_V33FindRealSource(meta, targetSlot)
+	local mutations = SpawnPet_V33MutationList(meta)
+	if #mutations == 0 then return nil end
+
+	local petTokens = {}
+	for _, v in ipairs({meta and meta.name, meta and meta.category}) do
+		local token = SpawnPet_V33Token(v)
+		if token ~= "" then petTokens[#petTokens+1] = token end
+	end
+
+	local pg = Player and Player:FindFirstChild("PlayerGui")
+	local bg = pg and pg:FindFirstChild("BackpackGui")
+	local backpack = bg and bg:FindFirstChild("Backpack")
+	if not backpack then return nil end
+
+	local inventory = backpack:FindFirstChild("Main") and backpack.Main:FindFirstChild("Inventory")
+	local hotbar = backpack:FindFirstChild("Hotbar")
+
+	-- Search Inventory first: its ToolName/Weight text can identify the exact
+	-- mutated pet even when the bottom hotbar has no visible name.
+	local roots = {}
+	if inventory then roots[#roots+1] = inventory end
+	if hotbar then roots[#roots+1] = hotbar end
+
+	local best, bestScore = nil, -math.huge
+
+	for rootIndex, root in ipairs(roots) do
+		for _, slot in ipairs(root:GetChildren()) do
+			if slot ~= targetSlot then
+				local icon = slot:FindFirstChild("Icon", true)
+				if icon and (icon:IsA("ImageLabel") or icon:IsA("ImageButton")) then
+					local text = SpawnPet_V33CollectText(slot)
+					local score = 0
+					local allMutations = true
+					for _, mutation in ipairs(mutations) do
+						if SpawnPet_V33ContainsToken(text, mutation) then
+							score += 100
+						else
+							allMutations = false
+						end
+					end
+					if not allMutations then
+						continue
+					end
+
+					local petMatch = false
+					for _, token in ipairs(petTokens) do
+						if SpawnPet_V33ContainsToken(text, token) then
+							score += 120
+							petMatch = true
+						end
+					end
+					if not petMatch and #petTokens > 0 then
+						-- Do not copy another pet's mutation icon.
+						continue
+					end
+
+					for _, child in ipairs(icon:GetChildren()) do
+						if SpawnPet_V33MutationChild(child, mutations) then
+							score += 70
+						end
+					end
+
+					if root == inventory then score += 20 end
+					if rootIndex == 2 and score < 120 then score -= 20 end
+
+					if score > bestScore then
+						bestScore = score
+						best = {
+							slot = slot,
+							icon = icon,
+							score = score,
+							exactPet = petMatch,
+							path = SpawnPet_V33Safe(function() return slot:GetFullName() end, tostring(slot)),
+						}
+					end
+				end
+			end
+		end
+	end
+
+	-- Second priority: mutation-first lookup. If there is no exact same-pet +
+	-- same-mutation source, learn the mutation visual from any real pet carrying
+	-- the requested mutation. The SpawnPet base icon remains the target pet's own
+	-- normal icon; only mutation-specific visual children are copied.
+	if not best then
+		local mutationOnlyBest, mutationOnlyScore = nil, -math.huge
+		for _, root in ipairs(roots) do
+			for _, slot in ipairs(root:GetChildren()) do
+				if slot ~= targetSlot then
+					local icon = slot:FindFirstChild("Icon", true)
+					if icon and (icon:IsA("ImageLabel") or icon:IsA("ImageButton")) then
+						local text = SpawnPet_V33CollectText(slot)
+						local score = 0
+						local allMutations = true
+						for _, mutation in ipairs(mutations) do
+							if SpawnPet_V33ContainsToken(text, mutation) then
+								score += 100
+							else
+								allMutations = false
+							end
+						end
+						if allMutations then
+							for _, child in ipairs(icon:GetChildren()) do
+								if SpawnPet_V33MutationChild(child, mutations) then
+									score += 70
+									break
+								end
+							end
+							if score > mutationOnlyScore then
+								mutationOnlyScore = score
+								mutationOnlyBest = {
+									slot = slot,
+									icon = icon,
+									score = score,
+									exactPet = false,
+									path = SpawnPet_V33Safe(function() return slot:GetFullName() end, tostring(slot)),
+								}
+							end
+						end
+					end
+				end
+			end
+		end
+		if mutationOnlyBest then
+			return mutationOnlyBest
+		end
+	end
+
+	return best
+end
+
+-- ============================================================
+-- v34.3: LIVE MUTATION VISUAL TEMPLATE LEARNING + EXACT PET/MUTATION ICON LOOKUP
+-- ============================================================
+-- The base pet icon ALWAYS comes from Directory.<Pet>.Icon.
+-- Mutation visuals are learned independently from the game's currently
+-- rendered Hotbar/Inventory icon tree.  This means a Rainbow Kitsune can use
+-- the REAL RainbowOverlayImage from any live Rainbow slot without replacing
+-- the Kitsune base icon with another pet's icon.
+
+function SpawnPet_V34MutationVisualKey(mutation)
+	return SpawnPet_V33Token(mutation)
+end
+
+function SpawnPet_V34RootMatchesMutation(node, mutation)
+	if not node then return false end
+	local wanted = SpawnPet_V33Token(mutation)
+	if wanted == "" then return false end
+	local n = SpawnPet_V33Token(node.Name)
+	if n == "" then return false end
+
+	-- Exact mutation name / mutation-specific overlay name is the strongest
+	-- signal.  Examples: RainbowOverlayImage, GoldenOverlayImage, etc.
+	if string.find(n, wanted, 1, true) then
+		return true
+	end
+
+	local knownOverlayNames = {
+		rainbow = {"rainbowoverlayimage", "rainbowoverlay"},
+		golden = {"goldenoverlayimage", "goldenoverlay"},
+		silver = {"silveroverlayimage", "silveroverlay"},
+		void = {"voidoverlayimage", "voidoverlay"},
+		boss = {"bossoverlayimage", "bossoverlay"},
+		greatbloom = {"greatbloomoverlayimage", "greatbloomoverlay"},
+		monstrous = {"monstrousoverlayimage", "monstrousoverlay"},
+		sakura = {"sakuraoverlayimage", "sakuraoverlay"},
+		scrambled = {"scrambledoverlayimage", "scrambledoverlay"},
+	}
+	for _, alias in ipairs(knownOverlayNames[wanted] or {}) do
+		if n == alias or string.find(n, alias, 1, true) then
+			return true
+		end
+	end
+	return false
+end
+
+function SpawnPet_V34GetMutationRoots(icon, mutation)
+	local roots = {}
+	local seen = {}
+	if not icon then return roots end
+
+	-- Preferred game structure:
+	-- Icon
+	--   -> RainbowOverlayImage
+	--      -> RarityGradient
+	for _, child in ipairs(icon:GetChildren()) do
+		if SpawnPet_V34RootMatchesMutation(child, mutation) then
+			if not seen[child] then
+				seen[child] = true
+				roots[#roots + 1] = child
+			end
+		end
+	end
+
+	-- Some versions may wrap the mutation visual one level deeper.  Walk the
+	-- descendants, then promote the matching object to the direct child of Icon
+	-- so the entire real visual tree is cloned intact.
+	if #roots == 0 then
+		for _, node in ipairs(icon:GetDescendants()) do
+			if SpawnPet_V34RootMatchesMutation(node, mutation) then
+				local root = node
+				while root.Parent and root.Parent ~= icon do
+					root = root.Parent
+				end
+				if root.Parent == icon and not seen[root] then
+					seen[root] = true
+					roots[#roots + 1] = root
+				end
+			end
+		end
+	end
+
+	return roots
+end
+
+function SpawnPet_V34FindLiveMutationVisual(mutation, targetSlot)
+	local key = SpawnPet_V34MutationVisualKey(mutation)
+	if key == "" then return nil, "empty-mutation" end
+
+	local cached = SpawnPetState.MutationVisualTemplateCache and SpawnPetState.MutationVisualTemplateCache[key]
+	if cached and cached.templates and #cached.templates > 0 then
+		return cached, "cache:" .. key
+	end
+
+	local pg = Player and Player:FindFirstChild("PlayerGui")
+	local bg = pg and pg:FindFirstChild("BackpackGui")
+	local backpack = bg and bg:FindFirstChild("Backpack")
+	if not backpack then return nil, "no-backpack-gui" end
+
+	local inventory = backpack:FindFirstChild("Main") and backpack.Main:FindFirstChild("Inventory")
+	local hotbar = backpack:FindFirstChild("Hotbar")
+	local roots = {}
+	if hotbar then roots[#roots + 1] = hotbar end
+	if inventory then roots[#roots + 1] = inventory end
+
+	local best = nil
+	local bestScore = -math.huge
+	for rootIndex, root in ipairs(roots) do
+		for _, slot in ipairs(root:GetChildren()) do
+			if slot ~= targetSlot then
+				local icon = slot:FindFirstChild("Icon", true)
+				if icon and (icon:IsA("ImageLabel") or icon:IsA("ImageButton")) then
+					local visualRoots = SpawnPet_V34GetMutationRoots(icon, mutation)
+					if #visualRoots > 0 then
+						local score = 100
+						-- Prefer an actual rendered Hotbar slot over Inventory when both
+						-- have the same mutation visual. The visual tree is identical,
+						-- but Hotbar is the exact target surface we are repairing.
+						if root == hotbar then score += 25 end
+
+						local text = SpawnPet_V33CollectText(slot)
+						if SpawnPet_V33ContainsToken(text, mutation) then
+							score += 50
+						end
+
+						if score > bestScore then
+							bestScore = score
+							best = {
+								slot = slot,
+								icon = icon,
+								roots = visualRoots,
+								path = SpawnPet_V33Safe(function() return slot:GetFullName() end, tostring(slot)),
+							}
+						end
+					end
+				end
+			end
+		end
+	end
+
+	if not best then
+		return nil, "no-live-" .. key .. "-visual"
+	end
+
+	local templates = {}
+	for _, sourceRoot in ipairs(best.roots) do
+		local clone
+		local ok = pcall(function()
+			clone = sourceRoot:Clone()
+		end)
+		if ok and clone then
+			templates[#templates + 1] = clone
+		end
+	end
+
+	if #templates == 0 then
+		return nil, "clone-failed-" .. key
+	end
+
+	SpawnPetState.MutationVisualTemplateCache = SpawnPetState.MutationVisualTemplateCache or {}
+	SpawnPetState.MutationVisualTemplateCache[key] = {
+		templates = templates,
+		sourcePath = best.path,
+	}
+	return SpawnPetState.MutationVisualTemplateCache[key], "live:" .. tostring(best.path)
+end
+
+function SpawnPet_V35WarmRealHotbarMutationCache()
+	local hotbar = SpawnPet_FindHotbar()
+	if not hotbar then return end
+	for _, mutation in ipairs({"Rainbow", "Golden", "Silver", "Void", "Boss", "GreatBloom", "Monstrous", "Sakura", "Scrambled"}) do
+		pcall(function() SpawnPet_V35CaptureHotbarMutationVisual(mutation) end)
+	end
+end
+
+task.defer(function()
+	-- Hotbar UI can populate after the script starts. Retry for a short window so
+	-- a real Mutation source is captured before the first spawn replaces a slot.
+	for i = 1, 20 do
+		pcall(SpawnPet_V35WarmRealHotbarMutationCache)
+		if i < 20 then task.wait(0.25) end
+	end
+end)
+
+function SpawnPet_V33GetSourceTemplate(meta, targetSlot)
+	-- New v34.2 path: collect each mutation's real overlay independently from
+	-- the live game UI.  This is intentionally NOT keyed by the target pet, so
+	-- the target pet can keep its own Directory.<Pet>.Icon.
+	local mutations = SpawnPet_V33MutationList(meta)
+	if #mutations == 0 then return nil, "none" end
+
+	local mutationTemplates = {}
+	local states = {}
+	local missing = {}
+	for _, mutation in ipairs(mutations) do
+		local entry, state = SpawnPet_V34FindLiveMutationVisual(mutation, targetSlot)
+		if entry and entry.templates and #entry.templates > 0 then
+			mutationTemplates[#mutationTemplates + 1] = {
+				mutation = mutation,
+				templates = entry.templates,
+			}
+			states[#states + 1] = mutation .. "=" .. tostring(state)
+		else
+			missing[#missing + 1] = mutation
+		end
+	end
+
+	if #missing > 0 then
+		-- Preserve the existing exact-source fallback for unusual mutation
+		-- layouts.  It is only used when the live visual template cannot be
+		-- discovered independently.
+		local key = SpawnPet_V33CacheKey(meta)
+		local cached = SpawnPetState.MutationIconCache and SpawnPetState.MutationIconCache[key]
+		if cached and cached.template then
+			return {
+				template = cached.template,
+				exactPet = cached.exactPet == true,
+				liveMutationTemplates = mutationTemplates,
+			}, "live-partial+cache:" .. key
+		end
+
+		local source = SpawnPet_V33FindRealSource(meta, targetSlot)
+		if source and source.icon then
+			local template
+			local ok = pcall(function() template = source.icon:Clone() end)
+			if ok and template then
+				SpawnPetState.MutationIconCache = SpawnPetState.MutationIconCache or {}
+				SpawnPetState.MutationIconCache[key] = {
+					template = template,
+					exactPet = source.exactPet == true,
+				}
+				return {
+					template = template,
+					exactPet = source.exactPet == true,
+					liveMutationTemplates = mutationTemplates,
+				}, "live-partial+legacy:" .. tostring(source.path)
+			end
+		end
+
+		return nil, "missing-live-mutation:" .. table.concat(missing, ",")
+	end
+
+	return {
+		template = nil,
+		exactPet = false,
+		liveMutationTemplates = mutationTemplates,
+	}, table.concat(states, " | ")
+end
+
+function SpawnPet_V33ClearMutationVisualChildren(icon)
+	if not icon then return end
+	local keys = {
+		"rainbow", "golden", "silver", "void", "boss", "mutation",
+		"greatbloom", "monstrous", "sakura", "scrambled", "raritygradient"
+	}
+	for _, child in ipairs(icon:GetChildren()) do
+		local n = SpawnPet_V33Token(child.Name)
+		for _, key in ipairs(keys) do
+			if string.find(n, key, 1, true) then
+				pcall(function() child:Destroy() end)
+				break
+			end
+		end
+	end
+end
+
+function SpawnPet_V33ApplyMutationHotbarVisual(slot, meta, baseIconId)
+	local icon = slot and slot:FindFirstChild("Icon", true)
+	if not (icon and (icon:IsA("ImageLabel") or icon:IsA("ImageButton"))) then
+		return false, "no-icon"
+	end
+
+	local base = SpawnPet_V35NormalizeImageId(baseIconId or "")
+	if base ~= "" then
+		pcall(function() icon.Image = base end)
+	end
+
+	local mutations = SpawnPet_V33MutationList(meta)
+	if #mutations == 0 then
+		SpawnPet_V35DestroyGeneratedMutationLayers(slot)
+		SpawnPet_V33ClearMutationVisualChildren(icon)
+		return true, "none"
+	end
+
+	-- Remove only layers created by this client-side spawner. Do not destroy the
+	-- game's genuine Icon children on the source slot.
+	SpawnPet_V35DestroyGeneratedMutationLayers(slot)
+	SpawnPet_V33ClearMutationVisualChildren(icon)
+
+	local states = {}
+	local cloned = 0
+
+	for _, mutation in ipairs(mutations) do
+		local key = SpawnPet_V33Token(mutation)
+		local entry, state = SpawnPet_V35CaptureHotbarMutationVisual(mutation)
+		local overlay = nil
+
+		if entry and entry.template then
+			overlay = SpawnPet_V35CloneGuiTree(entry.template)
+		end
+
+		if not overlay and key == "rainbow" then
+			-- The real scan proved the Rainbow composition. Build the same visual
+			-- locally when the live source has already disappeared from Hotbar.
+			local sourceIcon = nil
+			local hotbar = SpawnPet_FindHotbar()
+			if hotbar then
+				for _, sourceSlot in ipairs(hotbar:GetChildren()) do
+					local candidate = SpawnPet_V35GetDirectIcon(sourceSlot)
+					if candidate then
+						local liveRoot = SpawnPet_V35FindMutationRoot(candidate, mutation)
+						if liveRoot then
+							sourceIcon = liveRoot
+							break
+						end
+					end
+				end
+			end
+			overlay = select(1, SpawnPet_V35BuildRainbowFallback(base, sourceIcon))
+			state = state or "rainbow-local-composition"
+		end
+
+		if overlay then
+			overlay.Name = "__SpawnPetMutationVisual_" .. key
+			if SpawnPet_V35ConfigureMutationOverlay(overlay, slot, icon, base, mutation) then
+				cloned += 1
+				states[#states + 1] = mutation .. "=" .. tostring(state or "applied")
+			end
+		else
+			states[#states + 1] = mutation .. "=MISSING"
+		end
+	end
+
+	if cloned == 0 then
+		return false, "no-mutation-visual:" .. table.concat(mutations, ",")
+	end
+	return true, table.concat(states, " | ") .. "; layers=" .. tostring(cloned)
+end
+
+
+
+function SpawnPet_UpdateHotbarStableMutationLayers(slot, meta)
+	if not slot or not slot.Parent then
+		return false, "slot-missing"
+	end
+	return SpawnPet_HotbarRenderExactMutation(slot, meta or {})
+end
+
+
+
+-- ============================================================
+-- v35.0: EXACT MUTATION ICON PIPELINE FROM GAME SOURCE
+-- ============================================================
+-- Source discovered in ReplicatedStorage.Client.UI.AssetIconShape:
+--   ResolveImages(assetItem) -> imagesFor(directoryEntry, assetItem)
+--   Paint(imageLabel, assetItem)
+--   OverlayRainbow(imageLabel, rainbowImage)
+--
+-- IMPORTANT DISCOVERY:
+-- Rainbow is NOT a standalone Rainbow asset image.
+-- imagesFor() returns:
+--   Icon = iconFor(...)
+--   RainbowOverlay = directoryEntry.WhiteImage or Icon
+-- when BaseMutation/Mutations contains Mutations.Ids().Rainbow.
+--
+-- Paint() then creates the exact runtime layer:
+--   RainbowOverlayImage.Image = RainbowOverlay
+--   ImageTransparency = 0.5
+--   Size = UDim2.fromScale(1,1)
+--   Position = UDim2.fromScale(0.5,0.5)
+--   AnchorPoint = Vector2.new(0.5,0.5)
+--   ScaleType = Fit
+--   ZIndex = parent.ZIndex + 1
+--   Rarity.Rarities.Rainbow.RarityGradient:Clone().Parent = layer
+--
+-- Golden/Silver are handled by iconFor() through Directory.<Pet>.MutationIcons.
+-- Therefore this function delegates the entire mutation-icon job to the exact
+-- client module instead of searching any Hotbar slot.
+
+-- ============================================================
+-- v36.1: SOURCE-FAITHFUL MUTATION ICON RENDERER
+-- ============================================================
+-- The game's AssetIconShape source was confirmed:
+--   iconFor(): Golden/Silver can use Directory.<Pet>.MutationIcons[id]
+--   imagesFor(): RainbowOverlay = Directory.<Pet>.WhiteImage or Icon
+--   OverlayRainbow(): creates RainbowOverlayImage + clones
+--                    Rarity.Rarities.Rainbow.RarityGradient
+--
+-- We reproduce those exact data decisions locally instead of passing a
+-- reconstructed AssetItem through AssetIconShape.Paint(), because Paint()
+-- first validates AssetItem.AssetItemData(). That validation was the source
+-- of the fragile preview/spawn path in v36.
+-- ============================================================
+
+function SpawnPet_GetMutationDirectoryEntry(meta)
+	local okAssets, Assets = pcall(function()
+		return require(ReplicatedStorage.Data.Assets)
+	end)
+	if not okAssets or type(Assets) ~= "table" or type(Assets.Directory) ~= "table" then
+		return nil, "Assets.Directory unavailable"
+	end
+
+	local category = SpawnPet_Normalize(
+		meta and (meta.category or meta.name) or ""
+	)
+
+	local entry = Assets.Directory[category]
+	if type(entry) == "table" then
+		return entry, category
+	end
+
+	local wanted = string.lower(category)
+	for key, value in pairs(Assets.Directory) do
+		if string.lower(tostring(key)) == wanted and type(value) == "table" then
+			return value, tostring(key)
+		end
+	end
+
+	return nil, "Directory entry not found:" .. tostring(category)
+end
+
+function SpawnPet_ClearExactMutationIconVisual(icon)
+	if not icon then return end
+
+	-- Match AssetIconShape.Strip() for its two known visual containers.
+	pcall(function()
+		local overlay = icon:FindFirstChild("RainbowOverlayImage")
+		if overlay and overlay:IsA("ImageLabel") then
+			overlay:Destroy()
+		end
+	end)
+
+	pcall(function()
+		local layer = icon:FindFirstChild("AssetIconShapeLayer")
+		if layer then
+			layer:Destroy()
+		end
+	end)
+end
+
+function SpawnPet_FindMutationIconValue(entry, mutationName, mutationId)
+	if type(entry) ~= "table" then return "" end
+	local mutationIcons = entry.MutationIcons
+	if type(mutationIcons) ~= "table" then return "" end
+
+	local direct = mutationIcons[mutationId] or mutationIcons[mutationName]
+	if direct ~= nil and tostring(direct) ~= "" then
+		return tostring(direct)
+	end
+
+	local wantedName = SpawnPet_V33Token(mutationName)
+	local wantedId = SpawnPet_V33Token(mutationId)
+	for key, value in pairs(mutationIcons) do
+		if SpawnPet_V33Token(key) == wantedName
+			or (wantedId ~= "" and SpawnPet_V33Token(key) == wantedId) then
+			if value ~= nil and tostring(value) ~= "" then
+				return tostring(value)
+			end
+		end
+	end
+	return ""
+end
+
+function SpawnPet_SourceFaithfulMutationImage(meta)
+	local entry, reason = SpawnPet_GetMutationDirectoryEntry(meta)
+	if not entry then
+		return nil, nil, reason
+	end
+
+	local okMut, Mutations = pcall(function()
+		return require(ReplicatedStorage.Shared.Modules.Mutations)
+	end)
+	if not okMut or type(Mutations) ~= "table" or type(Mutations.Ids) ~= "function" then
+		return entry.Icon or "", nil, "Mutations.Ids unavailable"
+	end
+
+	local ids = Mutations.Ids()
+	local mutationList = SpawnPet_V33MutationList(meta)
+
+	-- Exact iconFor() behavior discovered in the game:
+	-- only Golden/Silver replace the normal Directory.Icon when the
+	-- corresponding mutation-specific image exists. Matching accepts both
+	-- the live numeric/string ID and the human-readable mutation name.
+	for _, pair in ipairs({
+		{ids.Golden, "Golden"},
+		{ids.Silver, "Silver"},
+	}) do
+		local id, name = pair[1], pair[2]
+		local carries = SpawnPet_HasMutationName(meta, name)
+		if not carries and id ~= nil then carries = SpawnPet_IsMetaMutation(meta, id) end
+		if carries then
+			local value = SpawnPet_FindMutationIconValue(entry, name, id)
+			if value ~= "" then
+				return value, nil, "MutationIcons:" .. name
+			end
+		end
+	end
+
+	-- Normal icon.
+	return tostring(entry.Icon or ""), nil, "Directory.Icon"
+end
+
+function SpawnPet_ApplySourceFaithfulRainbowOverlay(icon, meta, resolvedIcon)
+	if not icon or not icon:IsA("ImageLabel") then
+		return false, "icon-missing"
+	end
+
+	local okMut, Mutations = pcall(function()
+		return require(ReplicatedStorage.Shared.Modules.Mutations)
+	end)
+	if not okMut or type(Mutations) ~= "table" or type(Mutations.Ids) ~= "function" then
+		return false, "Mutations.Ids-unavailable"
+	end
+
+	local ids = Mutations.Ids()
+	local rainbowId = ids.Rainbow
+	if rainbowId == nil then
+		return false, "Rainbow-id-unavailable"
+	end
+
+	-- IMPORTANT: Selected/confirmed mutations in this script are normally
+	-- stored as human-readable names (for example "Rainbow"), while
+	-- Mutations.Ids().Rainbow can be a numeric/string enum ID. The previous
+	-- v41 code compared those two different representations directly, so
+	-- carriesRainbow became false and the Rainbow layer was never created.
+	local carriesRainbow = SpawnPet_HasMutationName(meta, "Rainbow")
+	if not carriesRainbow then
+		local rainbowToken = SpawnPet_V33Token(rainbowId)
+		if rainbowToken ~= "" then
+			if SpawnPet_V33Token(meta and meta.baseMutation) == rainbowToken then
+				carriesRainbow = true
+			else
+				for _, selected in ipairs(SpawnPet_V33MutationList(meta)) do
+					if SpawnPet_V33Token(selected) == rainbowToken then
+						carriesRainbow = true
+						break
+					end
+				end
+			end
+		end
+	end
+
+	if not carriesRainbow then
+		return true, "no-rainbow"
+	end
+
+	local entry = SpawnPet_GetMutationDirectoryEntry(meta)
+	if type(entry) ~= "table" then
+		return false, "Directory-entry-unavailable"
+	end
+
+	local okRarity, Rarity = pcall(function()
+		return require(ReplicatedStorage.Data.Rarity)
+	end)
+	if not okRarity or type(Rarity) ~= "table"
+		or type(Rarity.Rarities) ~= "table"
+		or type(Rarity.Rarities.Rainbow) ~= "table"
+		or not Rarity.Rarities.Rainbow.RarityGradient then
+		return false, "Rainbow-RarityGradient-unavailable"
+	end
+
+	-- Exact source:
+	-- v20 = p16.WhiteImage or v18
+	-- where v18 is iconFor(...)
+	local overlayImage = entry.WhiteImage
+	if overlayImage == nil or tostring(overlayImage) == "" then
+		overlayImage = resolvedIcon
+	end
+	overlayImage = tostring(overlayImage or "")
+
+	if overlayImage == "" then
+		return false, "Rainbow-overlay-image-empty"
+	end
+
+	-- Match AssetIconShape.OverlayRainbow() exactly.
+	local overlay = Instance.new("ImageLabel")
+	overlay.Name = "RainbowOverlayImage"
+	overlay.Image = SpawnPet_HotbarNormalizeImage(overlayImage)
+	overlay.ImageTransparency = 0.5
+	overlay.Size = UDim2.fromScale(1, 1)
+	overlay.Position = UDim2.fromScale(0.5, 0.5)
+	overlay.AnchorPoint = Vector2.new(0.5, 0.5)
+	overlay.BackgroundTransparency = 1
+	overlay.ScaleType = Enum.ScaleType.Fit
+	overlay.ZIndex = (tonumber(icon.ZIndex) or 0) + 1
+	overlay.Parent = icon
+
+	local gradient = Rarity.Rarities.Rainbow.RarityGradient:Clone()
+	gradient.Parent = overlay
+
+	return true, "RainbowOverlayImage=" .. overlayImage .. " + RarityGradient"
+end
+
+function SpawnPet_ApplySourceFaithfulMutationIcon(icon, meta)
+	if not icon or not icon:IsA("ImageLabel") then
+		return false, "Icon-must-be-ImageLabel"
+	end
+
+	meta = meta or {}
+
+	local resolvedIcon, _, sourceReason = SpawnPet_SourceFaithfulMutationImage(meta)
+	resolvedIcon = tostring(resolvedIcon or "")
+
+	if resolvedIcon == "" then
+		-- Preserve existing meta fallback rather than blanking the icon.
+		resolvedIcon = tostring(meta.image or "")
+	end
+
+	SpawnPet_ClearExactMutationIconVisual(icon)
+
+	-- Exact Paint() behavior for v49 <= 1:
+	-- set base image first, then overlay if Rainbow is present.
+	icon.Image = resolvedIcon
+	icon.ImageTransparency = 0
+	icon.BackgroundTransparency = 1
+	icon.ScaleType = Enum.ScaleType.Fit
+
+	local okRainbow, rainbowReason = SpawnPet_ApplySourceFaithfulRainbowOverlay(
+		icon,
+		meta,
+		resolvedIcon
+	)
+
+	if not okRainbow then
+		-- Base pet icon remains visible even when mutation visual cannot be built.
+		return false, sourceReason .. " | " .. tostring(rainbowReason)
+	end
+
+	return true, sourceReason .. " | " .. tostring(rainbowReason)
+end
+
+function SpawnPet_ExactMutationIconIsCurrent(icon, meta)
+	if not (icon and (icon:IsA("ImageLabel") or icon:IsA("ImageButton"))) then return false end
+
+	local expected = tostring(SpawnPet_SourceFaithfulMutationImage(meta) or "")
+	if expected ~= "" and tostring(icon.Image or "") ~= expected then
+		return false
+	end
+
+	if SpawnPet_HotbarIsRainbow(meta) then
+		local overlay = icon:FindFirstChild("RainbowOverlayImage")
+		if not (overlay and overlay:IsA("ImageLabel") and overlay.Visible) then
+			return false
+		end
+		if not overlay:FindFirstChild("RarityGradient") then
+			return false
+		end
+		return true
+	end
+
+	return icon:FindFirstChild("RainbowOverlayImage") == nil
+end
+
+-- ============================================================
+-- v36.5 HOTBAR STABLE MUTATION COMPOSITOR
+-- ============================================================
+-- Root cause confirmed from the live game source:
+--   BackpackController.UpdateVisuals()
+--       -> AssetIconShape.Strip(Icon)
+--       -> Icon.Image = TextureId
+--       -> optionally AssetIconShape.Paint(Icon, assetItem)
+--
+-- AssetIconShape.Strip() explicitly destroys Icon.RainbowOverlayImage.
+-- Therefore a mutation layer INSIDE Icon is not stable when the game's
+-- controller owns that Icon.
+--
+-- We therefore render mutation visuals as SIBLINGS of Icon:
+--
+--   Hotbar.<slot>
+--      Icon
+--      __SpawnPetMutationBaseOverlay   (Golden/Silver when needed)
+--      __SpawnPetRainbowOverlay        (Rainbow when needed)
+--
+-- The actual pet Icon can be repainted by the game without removing either
+-- sibling layer. We then re-align/recreate only our siblings.
+-- ============================================================
+
+function SpawnPet_RemoveHotbarMutationSiblings(slot)
+	if not slot then return end
+
+	for _, name in ipairs({
+		"__SpawnPetMutationBaseOverlay",
+		"__SpawnPetRainbowOverlay",
+		"__SpawnPetMutationVisual_rainbow",
+		"__SpawnPetMutationVisual_golden",
+		"__SpawnPetMutationVisual_silver",
+		"__SpawnPetMutationVisual_void",
+		"__SpawnPetMutationVisual_boss",
+		"__SpawnPetMutationVisual_greatbloom",
+		"__SpawnPetMutationVisual_monstrous",
+		"__SpawnPetMutationVisual_sakura",
+		"__SpawnPetMutationVisual_scrambled",
+	}) do
+		local obj = slot:FindFirstChild(name)
+		if obj then
+			pcall(function() obj:Destroy() end)
+		end
+	end
+
+	local replica = SpawnPetState.HotbarTopLevelReplicaBySlot
+		and SpawnPetState.HotbarTopLevelReplicaBySlot[slot]
+	if replica then
+		pcall(function() replica:Destroy() end)
+		SpawnPetState.HotbarTopLevelReplicaBySlot[slot] = nil
+	end
+end
+
+function SpawnPet_RemoveHotbarSiblingMutationOverlay(slot)
+	SpawnPet_RemoveHotbarMutationSiblings(slot)
+end
+
+function SpawnPet_IsMetaMutation(meta, wantedId)
+	if not meta or wantedId == nil then return false end
+
+	local wanted = SpawnPet_V33Token(wantedId)
+	if wanted == "" then return false end
+
+	local base = SpawnPet_V33Token(meta.baseMutation)
+	if base == wanted then
+		return true
+	end
+
+	for _, mutation in ipairs(SpawnPet_V33MutationList(meta)) do
+		if SpawnPet_V33Token(mutation) == wanted then
+			return true
+		end
+	end
+
+	return false
+end
+
+function SpawnPet_HasMutationName(meta, mutationName)
+	local wanted = SpawnPet_V33Token(mutationName)
+	if wanted == "" then return false end
+	for _, mutation in ipairs(SpawnPet_V33MutationList(meta) or {}) do
+		if SpawnPet_V33Token(mutation) == wanted then
+			return true
+		end
+	end
+	return SpawnPet_V33Token(meta and meta.baseMutation) == wanted
+end
+
+function SpawnPet_HotbarIsRainbow(meta)
+	return SpawnPet_HasMutationName(meta, "Rainbow")
+end
+
+function SpawnPet_HotbarOverlayAlign(overlay, icon, zBoost)
+	if not overlay or not icon then return end
+	-- Legacy sibling helper: when the icon is nested, absolute coordinates are
+	-- required. The active v38 renderer below uses the same absolute alignment
+	-- on a top-level ScreenGui replica.
+	local ok = pcall(function()
+		local pos = icon.AbsolutePosition
+		local size = icon.AbsoluteSize
+		local anchor = icon.AnchorPoint
+		overlay.Size = UDim2.fromOffset(math.max(1, size.X), math.max(1, size.Y))
+		overlay.Position = UDim2.fromOffset(
+			pos.X + size.X * anchor.X,
+			pos.Y + size.Y * anchor.Y
+		)
+		overlay.AnchorPoint = anchor
+		overlay.Rotation = icon.AbsoluteRotation
+		overlay.ZIndex = math.max((tonumber(icon.ZIndex) or 0) + (zBoost or 1), (zBoost or 1))
+	end)
+	if not ok then
+		pcall(function()
+			overlay.Size = icon.Size
+			overlay.Position = icon.Position
+			overlay.AnchorPoint = icon.AnchorPoint
+			overlay.Rotation = icon.Rotation
+		end)
+	end
+end
+
+function SpawnPet_HotbarMakeImageOverlay(name, slot, icon, image, transparency, zBoost)
+	if not slot or not icon then return nil end
+	if not image or tostring(image) == "" then return nil end
+
+	local old = slot:FindFirstChild(name)
+	if old then pcall(function() old:Destroy() end) end
+
+	local overlay = Instance.new("ImageLabel")
+	overlay.Name = name
+	overlay.BackgroundTransparency = 1
+	overlay.BorderSizePixel = 0
+	overlay.Active = false
+	overlay.Selectable = false
+	overlay.Visible = true
+	overlay.Image = tostring(image)
+	overlay.ImageTransparency = tonumber(transparency) or 0
+	overlay.ImageColor3 = Color3.new(1, 1, 1)
+	overlay.ScaleType = Enum.ScaleType.Fit
+
+	SpawnPet_HotbarOverlayAlign(overlay, icon, zBoost)
+	overlay.Parent = slot
+
+	return overlay
+end
+
+-- ============================================================
+-- v38.0: DEFINITIVE HOTBAR ICON RENDERER
+-- ============================================================
+-- The previous implementation mixed three incompatible paths:
+--   1) game-owned Icon children (BackpackController strips these),
+--   2) slot siblings positioned with Icon-local coordinates, and
+--   3) missing replica functions.
+--
+-- The active renderer below uses ONE source of truth:
+--   * Directory.<Pet>.Icon / MutationIcons -> the pet's base artwork
+--   * SpawnPet_V34FindLiveMutationVisual() -> live mutation visual trees when
+--     available, so the mutation is learned from the same function that scans
+--     the game's UI.
+--   * Data.Rarity.Rarities.Rainbow.RarityGradient -> authoritative Rainbow
+--     gradient fallback.
+--
+-- The final composite is a TOP-LEVEL ImageLabel replica. It is never a child
+-- of Icon, so AssetIconShape.Strip() cannot delete it. It is aligned using
+-- AbsolutePosition/AbsoluteSize/AbsoluteRotation, which also works when the
+-- game's Icon is nested inside another layout frame.
+-- ============================================================
+
+SpawnPetState.HotbarTopLevelReplicaBySlot = SpawnPetState.HotbarTopLevelReplicaBySlot or {}
+SpawnPetState.HotbarExtraMutationOverlayBySlot = SpawnPetState.HotbarExtraMutationOverlayBySlot or {}
+SpawnPetState.HotbarTopLevelReplicaRoot = SpawnPetState.HotbarTopLevelReplicaRoot or nil
+
+function SpawnPet_GetHotbarTopLevelReplicaRoot()
+	if SpawnPetState.HotbarTopLevelReplicaRoot and SpawnPetState.HotbarTopLevelReplicaRoot.Parent then
+		return SpawnPetState.HotbarTopLevelReplicaRoot
+	end
+	if not ScreenGui or not ScreenGui.Parent then return nil end
+
+	local root = Instance.new("Frame")
+	root.Name = "__SpawnPetHotbarMutationOverlayLayer"
+	root.Size = UDim2.fromScale(1, 1)
+	root.Position = UDim2.fromScale(0, 0)
+	root.BackgroundTransparency = 1
+	root.BorderSizePixel = 0
+	root.ClipsDescendants = false
+	root.Active = false
+	root.Selectable = false
+	root.ZIndex = 100
+	root.Parent = ScreenGui
+
+	SpawnPetState.HotbarTopLevelReplicaRoot = root
+	return root
+end
+
+function SpawnPet_HotbarNormalizeImage(value)
+	local s = tostring(value or "")
+	return SpawnPet_V35NormalizeImageId(s)
+end
+
+function SpawnPet_HotbarAlignTopLevelReplica(replica, icon)
+	if not replica or not icon or not icon.Parent then return false end
+	local ok = pcall(function()
+		local pos = icon.AbsolutePosition
+		local size = icon.AbsoluteSize
+		local anchor = icon.AnchorPoint
+		replica.Size = UDim2.fromOffset(math.max(1, size.X), math.max(1, size.Y))
+		replica.Position = UDim2.fromOffset(
+			pos.X + size.X * anchor.X,
+			pos.Y + size.Y * anchor.Y
+		)
+		replica.AnchorPoint = anchor
+		replica.Rotation = icon.AbsoluteRotation
+		replica.Visible = icon.Visible ~= false
+	end)
+	if not ok then return false end
+	return true
+end
+
+function SpawnPet_HotbarSetGuiFullFit(gui, image, transparency)
+	if not gui then return end
+	if gui:IsA("ImageLabel") or gui:IsA("ImageButton") then
+		pcall(function() gui.Image = tostring(image or "") end)
+		pcall(function() gui.ImageTransparency = tonumber(transparency) or 0 end)
+		pcall(function() gui.ImageColor3 = Color3.new(1,1,1) end)
+		pcall(function() gui.BackgroundTransparency = 1 end)
+		pcall(function() gui.BorderSizePixel = 0 end)
+		pcall(function() gui.AnchorPoint = Vector2.new(0,0) end)
+		pcall(function() gui.Position = UDim2.fromScale(0,0) end)
+		pcall(function() gui.Size = UDim2.fromScale(1,1) end)
+		pcall(function() gui.Rotation = 0 end)
+		pcall(function() gui.ScaleType = Enum.ScaleType.Fit end)
+		pcall(function() gui.Visible = true end)
+		pcall(function() gui.Active = false end)
+	end
+end
+
+function SpawnPet_LegacyHotbarDestroyTopLevelReplica(slot, restoreIcon)
+	local map = SpawnPetState.HotbarTopLevelReplicaBySlot
+	local replica = map and map[slot]
+	if replica then
+		pcall(function() replica:Destroy() end)
+		map[slot] = nil
+	end
+	local overlayMap = SpawnPetState.HotbarExtraMutationOverlayBySlot
+	local extra = overlayMap and overlayMap[slot]
+	if extra then
+		pcall(function() extra:Destroy() end)
+		overlayMap[slot] = nil
+	end
+
+	if restoreIcon then
+		local icon = slot and slot:FindFirstChild("Icon", true)
+		if icon and (icon:IsA("ImageLabel") or icon:IsA("ImageButton")) then
+			local original = SpawnPetState.HotbarOriginals and SpawnPetState.HotbarOriginals[slot]
+			pcall(function()
+				icon.ImageTransparency = original and tonumber(original.imageTransparency) or 0
+				icon.Visible = original and original.visible ~= false or true
+			end)
+		end
+	end
+end
+
+function SpawnPet_HotbarBuildRainbowReplica(replica, icon, meta, resolvedIcon)
+	if not replica then return false, "replica-missing" end
+
+	local old = replica:FindFirstChild("RainbowOverlayImage")
+	if old then pcall(function() old:Destroy() end) end
+
+	local entry = SpawnPet_GetMutationDirectoryEntry(meta)
+	if type(entry) ~= "table" then
+		return false, "Rainbow-Directory-entry-unavailable"
+	end
+
+	local overlayImage = entry.WhiteImage
+	if overlayImage == nil or tostring(overlayImage) == "" then
+		overlayImage = resolvedIcon
+	end
+	overlayImage = SpawnPet_HotbarNormalizeImage(overlayImage)
+	if overlayImage == "" then
+		return false, "Rainbow-overlay-image-empty"
+	end
+
+	local overlay = Instance.new("ImageLabel")
+	overlay.Name = "RainbowOverlayImage"
+	overlay.BackgroundTransparency = 1
+	overlay.BorderSizePixel = 0
+	overlay.AnchorPoint = Vector2.new(0,0)
+	overlay.Position = UDim2.fromScale(0,0)
+	overlay.Size = UDim2.fromScale(1,1)
+	overlay.Image = overlayImage
+	overlay.ImageTransparency = 0.5
+	overlay.ImageColor3 = Color3.new(1,1,1)
+	overlay.ScaleType = Enum.ScaleType.Fit
+	overlay.Visible = true
+	overlay.Active = false
+	overlay.ZIndex = 102
+
+	local gradient = nil
+	-- First use the same live mutation finder used by the scan system. This
+	-- captures the exact RarityGradient tree the running game is using.
+	local live = nil
+	pcall(function() live = SpawnPet_V34FindLiveMutationVisual("Rainbow", nil) end)
+	if live and live.templates and #live.templates > 0 then
+		local candidate = live.templates[1]
+		local srcGradient = candidate and candidate:FindFirstChild("RarityGradient", true)
+		if srcGradient and srcGradient:IsA("UIGradient") then
+			gradient = srcGradient:Clone()
+		end
+	end
+
+	-- Fallback to the authoritative replicated Rainbow rarity style when no
+	-- live source slot is currently available.
+	if not gradient then
+		local okRarity, Rarity = pcall(function()
+			return require(ReplicatedStorage.Data.Rarity)
+		end)
+		if okRarity and type(Rarity) == "table" and type(Rarity.Rarities) == "table"
+			and type(Rarity.Rarities.Rainbow) == "table" and Rarity.Rarities.Rainbow.RarityGradient then
+			gradient = Rarity.Rarities.Rainbow.RarityGradient:Clone()
+		end
+	end
+
+	if not gradient then
+		return false, "Rainbow-RarityGradient-unavailable"
+	end
+
+	gradient.Name = "RarityGradient"
+	pcall(function() gradient.Enabled = true end)
+	gradient.Parent = overlay
+	overlay.Parent = replica
+
+	return true, "Rainbow-overlay+RarityGradient"
+end
+
+function SpawnPet_HotbarBuildLiveMutationReplicas(replica, slot, icon, meta, resolvedIcon)
+	local states = {}
+	local mutationList = SpawnPet_V33MutationList(meta)
+	for _, mutation in ipairs(mutationList) do
+		local key = SpawnPet_V33Token(mutation)
+		if key ~= "rainbow" and key ~= "golden" and key ~= "silver" then
+			local live = nil
+			pcall(function() live = SpawnPet_V34FindLiveMutationVisual(mutation, slot) end)
+			if live and live.templates then
+				for index, template in ipairs(live.templates) do
+					local clone = nil
+					pcall(function() clone = template:Clone() end)
+					if clone and clone:IsA("GuiObject") then
+						clone.Name = "MutationOverlay_" .. key .. "_" .. tostring(index)
+						clone.AnchorPoint = Vector2.new(0,0)
+						clone.Position = UDim2.fromScale(0,0)
+						clone.Size = UDim2.fromScale(1,1)
+						clone.Rotation = 0
+						clone.ZIndex = 103 + index
+						clone.Visible = true
+						clone.Active = false
+						if clone:IsA("ImageLabel") or clone:IsA("ImageButton") then
+							clone.Image = resolvedIcon
+							clone.ImageColor3 = Color3.new(1,1,1)
+						end
+						clone.Parent = replica
+						states[#states+1] = mutation .. "=live"
+					end
+				end
+			end
+		end
+	end
+	return states
+end
+
+function SpawnPet_LegacyCaptureControlPanelVisualForTool(tool, meta)
+	if not tool then return nil end
+	SpawnPetState.ControlPanelVisualByTool = SpawnPetState.ControlPanelVisualByTool or setmetatable({}, {__mode="k"})
+
+	local sourceIcon = SpawnPetState.Icon
+	if not (sourceIcon and (sourceIcon:IsA("ImageLabel") or sourceIcon:IsA("ImageButton"))) then
+		return nil
+	end
+
+	-- Before capturing the Control Panel, guarantee that its actual displayed
+	-- tree contains the selected mutation layer. This is especially important
+	-- for Rainbow because the pet icon itself is only the base layer.
+	if SpawnPet_HasMutationName(meta, "Rainbow") then
+		local hasRainbowLayer = false
+		for _, node in ipairs(sourceIcon:GetDescendants()) do
+			if SpawnPet_V33Token(node.Name) == "rainbowoverlayimage" then
+				hasRainbowLayer = true
+				break
+			end
+		end
+		if not hasRainbowLayer then
+			pcall(function()
+				SpawnPet_ApplySourceFaithfulMutationIcon(sourceIcon, meta)
+			end)
+		end
+	end
+
+	local keys = {}
+	for _, mutation in ipairs(SpawnPet_V33MutationList(meta or {})) do
+		keys[#keys+1] = SpawnPet_V33Token(mutation)
+	end
+	table.sort(keys)
+
+	-- CRITICAL: clone the ENTIRE Control Panel icon object, not just its Image
+	-- property and not a separately reconstructed mutation layer. For Rainbow
+	-- this preserves Icon -> RainbowOverlayImage -> RarityGradient as one exact
+	-- UI tree.
+	local tree
+	local okClone = pcall(function()
+		tree = sourceIcon:Clone()
+	end)
+	if not okClone or not tree then
+		return nil
+	end
+	pcall(function() tree.Parent = nil end)
+
+	local snapshot = {
+		image = tostring(sourceIcon.Image or ""),
+		imageTransparency = tonumber(sourceIcon.ImageTransparency) or 0,
+		visible = sourceIcon.Visible ~= false,
+		scaleType = sourceIcon.ScaleType,
+		imageColor3 = sourceIcon.ImageColor3,
+		mutationSignature = table.concat(keys, "+"),
+		tree = tree,
+		childCount = #sourceIcon:GetChildren(),
+		mutationLayerCount = 0,
+	}
+
+	for _, child in ipairs(sourceIcon:GetDescendants()) do
+		local n = SpawnPet_V33Token(child.Name or "")
+		if string.find(n, "overlay", 1, true) ~= nil
+			or string.find(n, "raritygradient", 1, true) ~= nil then
+			snapshot.mutationLayerCount += 1
+		end
+	end
+
+	SpawnPetState.ControlPanelVisualByTool[tool] = snapshot
+	return snapshot
+end
+
+function SpawnPet_GetControlPanelHotbarSnapshot(slot, tool, meta)
+	SpawnPetState.ControlPanelVisualByTool = SpawnPetState.ControlPanelVisualByTool or setmetatable({}, {__mode="k"})
+	SpawnPetState.ControlPanelVisualBySlot = SpawnPetState.ControlPanelVisualBySlot or {}
+
+	local expectedKeys = {}
+	for _, mutation in ipairs(SpawnPet_V33MutationList(meta or {})) do
+		expectedKeys[#expectedKeys+1] = SpawnPet_V33Token(mutation)
+	end
+	table.sort(expectedKeys)
+	local expectedSignature = table.concat(expectedKeys, "+")
+
+	-- A slot can be reused. Never blindly reuse a previous pet's snapshot.
+	local snapshot = tool and SpawnPetState.ControlPanelVisualByTool[tool] or nil
+	if snapshot and snapshot.mutationSignature == expectedSignature then
+		SpawnPetState.ControlPanelVisualBySlot[slot] = snapshot
+		return snapshot
+	end
+
+	snapshot = SpawnPet_CaptureControlPanelVisualForTool(tool, meta)
+	if snapshot then
+		SpawnPetState.ControlPanelVisualBySlot[slot] = snapshot
+	end
+	return snapshot
+end
+
+function SpawnPet_CopyControlPanelVisualToHotbarReplica(replica, snapshot)
+	if not replica or not snapshot or not snapshot.tree then return false, "snapshot-tree-missing" end
+
+	-- Rebuild the replica from the EXACT cloned Control Panel Icon tree.
+	for _, child in ipairs(replica:GetChildren()) do
+		pcall(function() child:Destroy() end)
+	end
+
+	pcall(function()
+		replica.Image = snapshot.tree.Image
+		replica.ImageTransparency = snapshot.tree.ImageTransparency
+		replica.ImageColor3 = snapshot.tree.ImageColor3
+		replica.BackgroundTransparency = 1
+		replica.BorderSizePixel = 0
+		replica.ScaleType = snapshot.tree.ScaleType
+		replica.Visible = snapshot.visible ~= false
+		replica.Active = false
+		replica.ClipsDescendants = false
+	end)
+
+	local cloned = 0
+	local mutationNodes = 0
+	for _, templateChild in ipairs(snapshot.tree:GetChildren()) do
+		local ok, clone = pcall(function() return templateChild:Clone() end)
+		if ok and clone then
+			if clone:IsA("GuiObject") then
+				clone.Visible = true
+				clone.Active = false
+				clone.ClipsDescendants = false
+				local n = SpawnPet_V33Token(clone.Name or "")
+				local isMutation = string.find(n, "overlay", 1, true) ~= nil
+					or string.find(n, "raritygradient", 1, true) ~= nil
+				clone.ZIndex = isMutation and 1001 or 1000
+				if isMutation then mutationNodes += 1 end
+			end
+			clone.Parent = replica
+			cloned += 1
+		end
+	end
+
+	-- Rebase ALL nested GuiObjects in the copied tree so mutation layers are
+	-- definitely above the pet artwork and nothing inherits an out-of-context
+	-- Control Panel ZIndex. UIGradient is preserved as a child of its source
+	-- mutation ImageLabel.
+	for _, node in ipairs(replica:GetDescendants()) do
+		if node:IsA("GuiObject") then
+			node.Visible = true
+			node.Active = false
+			local n = SpawnPet_V33Token(node.Name or "")
+			local isMutation = string.find(n, "overlay", 1, true) ~= nil
+				or string.find(n, "raritygradient", 1, true) ~= nil
+			node.ZIndex = isMutation and 1001 or 1000
+		end
+	end
+
+	return true, "control-panel-full-tree:" .. tostring(snapshot.image)
+		.. ";children=" .. tostring(cloned)
+		.. ";mutationNodes=" .. tostring(mutationNodes)
+end
+
+function SpawnPet_HotbarApplyOneExtraMutationOverlay(root, slot, icon, snapshot)
+	if not root or not slot or not icon or not snapshot then return false, "missing" end
+
+	SpawnPetState.HotbarExtraMutationOverlayBySlot = SpawnPetState.HotbarExtraMutationOverlayBySlot or {}
+	local old = SpawnPetState.HotbarExtraMutationOverlayBySlot[slot]
+	if old then pcall(function() old:Destroy() end) end
+
+	local template = snapshot.mutationOverlay
+	if not template then
+		return false, "ControlPanel-mutation-layer-missing"
+	end
+
+	local ok, overlay = pcall(function() return template:Clone() end)
+	if not ok or not overlay or not overlay:IsA("GuiObject") then
+		return false, "mutation-layer-clone-failed"
+	end
+
+	overlay.Name = "__SpawnPetHotbarExtraMutationOverlay"
+	overlay.Parent = root
+	SpawnPetState.HotbarExtraMutationOverlayBySlot[slot] = overlay
+	overlay.Active = false
+	overlay.Visible = true
+	overlay.AnchorPoint = Vector2.new(0,0)
+	overlay.Position = UDim2.fromScale(0,0)
+	overlay.Size = UDim2.fromScale(1,1)
+	overlay.Rotation = 0
+	overlay.ZIndex = 1002
+
+	-- The captured Control Panel mutation layer is copied without rebuilding its
+	-- artwork. This preserves RainbowOverlayImage and its RarityGradient exactly.
+	for _, node in ipairs(overlay:GetDescendants()) do
+		if node:IsA("GuiObject") then
+			node.Active = false
+			node.Visible = true
+		end
+	end
+
+	local baseGui = overlay
+	if baseGui:IsA("ImageLabel") or baseGui:IsA("ImageButton") then
+		baseGui.ScaleType = Enum.ScaleType.Fit
+	end
+
+	SpawnPet_HotbarAlignTopLevelReplica(overlay, icon)
+	return true, "extra-mutation-overlay=" .. tostring(template.Name)
+end
+
+-- FINAL COMPOSITION: Control Panel base icon + ONE explicit mutation overlay.
+function SpawnPet_LegacyHotbarRenderExactMutation(slot, meta)
+	if not slot or not slot.Parent then return false, "slot-missing" end
+	meta = meta or {}
+
+	local icon = slot:FindFirstChild("Icon", true)
+	if not (icon and (icon:IsA("ImageLabel") or icon:IsA("ImageButton"))) then
+		return false, "Icon-missing"
+	end
+
+	SpawnPetState.HotbarTopLevelReplicaBySlot = SpawnPetState.HotbarTopLevelReplicaBySlot or {}
+	local root = SpawnPet_GetHotbarTopLevelReplicaRoot()
+	if not root then return false, "replica-root-unavailable" end
+
+	local tool = nil
+	for candidate, boundSlot in pairs(SpawnPetState.ToolToSlot or {}) do
+		if boundSlot == slot then
+			tool = candidate
+			break
+		end
+	end
+
+	local snapshot = SpawnPet_GetControlPanelHotbarSnapshot(slot, tool, meta)
+	if not snapshot or not snapshot.tree then
+		return false, "ControlPanel-full-tree-unavailable"
+	end
+
+	local expectedSignature = tostring(snapshot.mutationSignature or "")
+		.. "|layers=" .. tostring(snapshot.mutationLayerCount or 0)
+		.. "|tree=" .. tostring(snapshot.childCount or 0)
+	local replica = SpawnPetState.HotbarTopLevelReplicaBySlot[slot]
+	local currentSignature = replica and tostring(replica:GetAttribute("__SpawnPetControlPanelMutationSignature") or "") or ""
+
+	if not (replica and replica.Parent == root and currentSignature == expectedSignature) then
+		if replica then pcall(function() replica:Destroy() end) end
+
+		-- CRITICAL: use the actual Control Panel Icon clone as the Hotbar visual.
+		-- Do not rebuild its children into another ImageLabel. This preserves every
+		-- render layer exactly as the Control Panel has it: pet Image,
+		-- RainbowOverlayImage, RarityGradient, and any additional mutation nodes.
+		local okClone, freshReplica = pcall(function() return snapshot.tree:Clone() end)
+		if not okClone or not freshReplica then
+			return false, "ControlPanel-tree-clone-failed"
+		end
+
+		-- Final structural guard: a Rainbow pet MUST have a RainbowOverlayImage
+		-- in the cloned visual tree. Do not allow a base-only replica through.
+		if SpawnPet_HasMutationName(meta, "Rainbow") then
+			local rainbowNode = nil
+			for _, node in ipairs(freshReplica:GetDescendants()) do
+				if SpawnPet_V33Token(node.Name) == "rainbowoverlayimage" then
+					rainbowNode = node
+					break
+				end
+			end
+			if not rainbowNode then
+				-- Re-capture once from the current Control Panel Icon so the Hotbar
+				-- never silently falls back to a base-only pet image.
+				local refreshed = SpawnPet_CaptureControlPanelVisualForTool(tool, meta)
+				if refreshed and refreshed.tree then
+					local okRetry, retryTree = pcall(function() return refreshed.tree:Clone() end)
+					if okRetry and retryTree then
+						freshReplica:Destroy()
+						freshReplica = retryTree
+						for _, node in ipairs(freshReplica:GetDescendants()) do
+							if SpawnPet_V33Token(node.Name) == "rainbowoverlayimage" then
+								rainbowNode = node
+							break
+							end
+						end
+					end
+				end
+			end
+			if not rainbowNode then
+				return false, "Rainbow-layer-missing-from-ControlPanel-tree"
+			end
+		end
+
+		freshReplica.Name = "__SpawnPetHotbarControlPanelReplica"
+		freshReplica.Parent = root
+		freshReplica.BackgroundTransparency = 1
+		freshReplica.BorderSizePixel = 0
+		freshReplica.Active = false
+		freshReplica.Visible = true
+		freshReplica.ClipsDescendants = false
+		freshReplica.ZIndex = 2000
+
+		-- Rebase the copied tree. Mutation visual nodes are always one layer above
+		-- the pet artwork. Preserve UIGradient instances under their source node.
+		for _, node in ipairs(freshReplica:GetDescendants()) do
+			if node:IsA("GuiObject") then
+				node.Visible = true
+				node.Active = false
+				if node:IsA("GuiObject") then node.ClipsDescendants = false end
+				local n = SpawnPet_V33Token(node.Name or "")
+				local isMutation = string.find(n, "overlay", 1, true) ~= nil
+					or string.find(n, "mutation", 1, true) ~= nil
+					or string.find(n, "raritygradient", 1, true) ~= nil
+				node.ZIndex = isMutation and 2002 or 2001
+			elseif node:IsA("UIGradient") then
+				pcall(function() node.Enabled = true end)
+			end
+		end
+
+		replica:SetAttribute("__SpawnPetControlPanelMutationSignature", expectedSignature)
+		replica:SetAttribute("__SpawnPetControlPanelImage", tostring(snapshot.image or ""))
+		replica:SetAttribute("__SpawnPetControlPanelState",
+			"CONTROL_PANEL_FULL_TREE;mutationLayers=" .. tostring(snapshot.mutationLayerCount or 0))
+		SpawnPetState.HotbarTopLevelReplicaBySlot[slot] = freshReplica
+		replica = freshReplica
+	end
+
+	-- Keep the clone visually identical to the captured Control Panel root.
+	pcall(function()
+		replica.Image = snapshot.tree.Image
+		replica.ImageTransparency = snapshot.tree.ImageTransparency
+		replica.ImageColor3 = snapshot.tree.ImageColor3
+		replica.ScaleType = snapshot.tree.ScaleType
+		replica.Visible = snapshot.visible ~= false
+		replica.ClipsDescendants = false
+	end)
+	SpawnPet_HotbarAlignTopLevelReplica(replica, icon)
+
+	-- The game-owned Icon stays in its slot for the BackpackController, but its
+	-- own artwork is hidden. The top-level Control Panel clone is the only visible
+	-- artwork and already contains the mutation layer.
+	pcall(function()
+		icon.ImageTransparency = 1
+		icon.Visible = true
+	end)
+
+	slot:SetAttribute("__SpawnPetControlPanelImageId", tostring(snapshot.image or ""))
+	slot:SetAttribute("__SpawnPetControlPanelMutationSignature", expectedSignature)
+	return true, "control-panel-full-tree=" .. tostring(snapshot.image)
+		.. ";mutationLayers=" .. tostring(snapshot.mutationLayerCount or 0)
+end
+
+function SpawnPet_CreateHotbarStableMutationLayers(slot, meta, icon)
+	return SpawnPet_HotbarRenderExactMutation(slot, meta or {})
+end
+
+
+-- Override the hotbar path so it NEVER writes RainbowOverlayImage as a child of
+-- Icon. Preview may still use the source-faithful child renderer; Hotbar uses
+-- only the sibling compositor above.
+function SpawnPet_LegacyEnsureMutationHotbarVisual(slot, meta, iconId)
+	if not slot or not slot.Parent then return false, "slot-missing" end
+	local icon = slot:FindFirstChild("Icon", true)
+	if not (icon and (icon:IsA("ImageLabel") or icon:IsA("ImageButton"))) then
+		return false, "Icon-missing"
+	end
+
+	local ok, reason = SpawnPet_UpdateHotbarStableMutationLayers(slot, meta or {})
+	if ok then return true, reason end
+
+	-- Last-resort base image only. Normal spawn/refill should always use the
+	-- saved Control Panel visual above.
+	local fallback = SpawnPet_HotbarNormalizeImage(iconId or "")
+	if fallback ~= "" then
+		pcall(function()
+			icon.Image = fallback
+			icon.ImageTransparency = 0
+			icon.ScaleType = Enum.ScaleType.Fit
+		end)
+	end
+	return false, reason
+end
+
+-- ============================================================
+-- v36.3 HOTBAR MUTATION ICON EVENT WATCHDOG
+-- ============================================================
+-- The real BackpackController can rebuild a slot after we write the icon.
+-- Its own UpdateVisuals() starts with AssetIconShape.Strip(Icon), which can
+-- remove RainbowOverlayImage. A 0.10s RenderStepped repair is therefore
+-- not sufficient: the game can repaint the slot between repair ticks.
+--
+-- This watchdog watches the ACTUAL Icon for:
+--   * Image changes
+--   * RainbowOverlayImage being removed
+--   * RarityGradient being removed
+-- and immediately reapplies the source-faithful mutation visual.
+--
+-- It still uses the source-confirmed icon rules:
+--   Golden/Silver -> Directory.MutationIcons
+--   Rainbow       -> Directory.WhiteImage(or Icon) +
+--                     Rarity.Rarities.Rainbow.RarityGradient
+-- ============================================================
+
+function SpawnPet_LegacyStartHotbarMutationWatchdog(slot, tool, meta, iconId)
+	if not slot or not slot.Parent then return end
+
+	SpawnPetState.HotbarMutationWatchdogs = SpawnPetState.HotbarMutationWatchdogs or {}
+	local old = SpawnPetState.HotbarMutationWatchdogs[slot]
+	if old and old.connections then
+		for _, c in ipairs(old.connections) do pcall(function() c:Disconnect() end) end
+	end
+
+	local state = {
+		slot = slot,
+		tool = tool,
+		meta = meta,
+		iconId = iconId,
+		connections = {},
+	}
+	SpawnPetState.HotbarMutationWatchdogs[slot] = state
+
+	local function alive()
+		return slot.Parent ~= nil and tool ~= nil and tool.Parent ~= nil
+	end
+
+	local function ensure()
+		if not alive() then return end
+		pcall(function() SpawnPet_HotbarRenderExactMutation(slot, state.meta) end)
+	end
+
+	table.insert(state.connections, slot.DescendantAdded:Connect(function(child)
+		if child.Name == "Icon" then
+			task.defer(ensure)
+		end
+	end))
+
+	table.insert(state.connections, slot.DescendantRemoving:Connect(function(child)
+		if child.Name == "Icon" then
+			task.defer(ensure)
+		end
+	end))
+
+	table.insert(state.connections, slot.AncestryChanged:Connect(function(_, parent)
+		if not parent then
+			SpawnPet_HotbarDestroyTopLevelReplica(slot, false)
+			for _, c in ipairs(state.connections) do pcall(function() c:Disconnect() end) end
+			if SpawnPetState.HotbarMutationWatchdogs then SpawnPetState.HotbarMutationWatchdogs[slot] = nil end
+		end
+	end))
+
+	ensure()
+end
+
+
 function SpawnPet_BindHotbarSlot(slot, tool, meta, iconId)
 	if not slot then return false end
 	-- Never overwrite an occupied pet slot. Send must never mutate existing hotbar pets.
 	if slot:GetAttribute("__SpawnPetOccupied") == true then return false end
 	SpawnPetState.HotbarOriginals = SpawnPetState.HotbarOriginals or {}
 	if not SpawnPetState.HotbarOriginals[slot] then
-		local icon=slot:FindFirstChild("Icon",true)
+		local icon=SpawnPet_FindActualHotbarIcon(slot, tool)
 		local tip=slot:FindFirstChild("ToolTip",true)
 		SpawnPetState.HotbarOriginals[slot] = {
 			icon = icon and ((icon:IsA("ImageLabel") or icon:IsA("ImageButton")) and icon.Image or "") or "",
+			imageTransparency = icon and ((icon:IsA("ImageLabel") or icon:IsA("ImageButton")) and tonumber(icon.ImageTransparency) or 0) or 0,
+			visible = icon and ((icon:IsA("ImageLabel") or icon:IsA("ImageButton")) and icon.Visible ~= false or true) or true,
 			tooltip = tip and ((tip:IsA("TextLabel") or tip:IsA("TextButton")) and tip.Text or "") or ""
 		}
 	end
 	slot:SetAttribute("__SpawnPetOccupied", true)
 	slot:SetAttribute("__SpawnPetName", meta.name)
-	local icon=slot:FindFirstChild("Icon",true)
-	if icon and (icon:IsA("ImageLabel") or icon:IsA("ImageButton")) and iconId~="" then
-		pcall(function() icon.Image=iconId end)
+	local icon=SpawnPet_FindActualHotbarIcon(slot, tool)
+
+	-- Capture the exact Control Panel visual after Search/Mutation rendering.
+	SpawnPetState.ControlPanelVisualByTool = SpawnPetState.ControlPanelVisualByTool or setmetatable({}, {__mode="k"})
+	SpawnPetState.ControlPanelVisualBySlot = SpawnPetState.ControlPanelVisualBySlot or {}
+	local panelSnapshot = SpawnPet_CaptureControlPanelVisualForTool(tool, meta)
+	if panelSnapshot then
+		SpawnPetState.ControlPanelVisualBySlot[slot] = panelSnapshot
 	end
+
+	-- The exact mutation renderer below is now the SINGLE source of truth for
+	-- this Hotbar icon. Do not pre-write iconId here because that can race the
+	-- game's own UpdateVisuals() and erase the mutation state.
+	-- v36.7: source-faithful mutation icon renderer.
+	local mutationOk, mutationReason = SpawnPet_EnsureMutationHotbarVisual(slot, meta, iconId)
+	if not mutationOk and not (SpawnPet_HotbarIsRainbow and SpawnPet_HotbarIsRainbow(meta)) then
+		-- Non-Rainbow pets may use the normal base-icon fallback. Rainbow must
+		-- never silently downgrade to base-only because its mutation layer is
+		-- required to be present in the final Hotbar composition.
+		pcall(function()
+			if icon and iconId and SpawnPet_Normalize(iconId) ~= "" then
+				icon.Image = iconId
+			end
+		end)
+	end
+	slot:SetAttribute("__SpawnPetMutationVisualState", tostring(mutationReason or ""))
+
 	local tip=slot:FindFirstChild("ToolTip",true)
 	if tip and (tip:IsA("TextLabel") or tip:IsA("TextButton")) then
 		local tooltipText = meta.name
@@ -3303,7 +5782,973 @@ function SpawnPet_BindHotbarSlot(slot, tool, meta, iconId)
 	SpawnPetState.HotbarBindings[slot]=connection
 	SpawnPetState.ToolToSlot = SpawnPetState.ToolToSlot or {}
 	SpawnPetState.ToolToSlot[tool] = slot
+
+
+	-- The top-level renderer is the only active Hotbar mutation writer.
+	pcall(function()
+		SpawnPet_HotbarRenderExactMutation(slot, meta)
+	end)
+
+	-- Event-driven + per-frame absolute-position repair. The game may rebuild
+	-- Icon or move the Hotbar during selection/equip; our replica stays aligned.
+	SpawnPet_StartHotbarMutationWatchdog(slot, tool, meta, iconId)
+
 	return true
+end
+
+-- ==========================================
+-- CLIENT VISUAL PET -> CLICK BASE -> PLACE
+-- ==========================================
+-- Virtual pets created by SpawnPet_CreateTool are real client-side Tools.
+-- When one of those Tools is equipped, clicking the world places the SAME
+-- visual Model into Workspace.ClientRenderedAssets instead of creating a
+-- second pet. The visual is then anchored and locally wandered around the
+-- clicked base position.
+SpawnPetState.PlacedVisuals = SpawnPetState.PlacedVisuals or {}
+SpawnPetState.PlacementConnections = SpawnPetState.PlacementConnections or {}
+SpawnPetState.PlacementCooldownUntil = tonumber(SpawnPetState.PlacementCooldownUntil) or 0
+
+local function SpawnPet_IsInvalidPlotCandidate(candidate)
+	if not candidate then return true end
+	if candidate == Player.Character then return true end
+	local char = Player.Character
+	if char and candidate:IsDescendantOf(char) then return true end
+	if candidate.Name == "ClientRenderedAssets" then return true end
+	if candidate == Workspace.CurrentCamera then return true end
+
+	local okSize, _, size = pcall(function()
+		return candidate:GetBoundingBox()
+	end)
+	if okSize and size then
+		-- A real plot/base is expected to have a meaningful floor area.
+		if size.X < 15 and size.Z < 15 then return true end
+	end
+	return false
+end
+
+local function SpawnPet_FindOwnPlacementPlot()
+	local char = Player.Character
+	local plots = Workspace and Workspace:FindFirstChild("Plots")
+
+	if plots then
+		-- Exact owner metadata first.
+		for _, plot in ipairs(plots:GetChildren()) do
+			if not SpawnPet_IsInvalidPlotCandidate(plot) then
+				local ownerId = plot:GetAttribute("OwnerUserId")
+					or plot:GetAttribute("OwnerId")
+					or plot:GetAttribute("UserId")
+				local ownerName = plot:GetAttribute("OwnerName")
+					or plot:GetAttribute("Owner")
+
+				if tonumber(ownerId) == Player.UserId
+					or tostring(ownerName or "") == Player.Name
+					or tostring(ownerName or "") == Player.DisplayName then
+					return plot
+				end
+			end
+		end
+
+		-- Name match, excluding the character and tiny helper models.
+		local playerNameLower = string.lower(Player.Name)
+		local displayLower = string.lower(Player.DisplayName or "")
+		for _, plot in ipairs(plots:GetChildren()) do
+			if not SpawnPet_IsInvalidPlotCandidate(plot) then
+				local n = string.lower(tostring(plot.Name))
+				if string.find(n, playerNameLower, 1, true)
+					or (displayLower ~= "" and string.find(n, displayLower, 1, true)) then
+					return plot
+				end
+			end
+		end
+	end
+
+	-- Direct Workspace roots: NEVER accept Player.Character as a plot.
+	local observed = Workspace and Workspace:FindFirstChild("AraSadboizVN")
+	if observed and not SpawnPet_IsInvalidPlotCandidate(observed)
+		and (observed:IsA("Model") or observed:IsA("Folder")) then
+		return observed
+	end
+
+	if Workspace then
+		for _, candidate in ipairs(Workspace:GetChildren()) do
+			if not SpawnPet_IsInvalidPlotCandidate(candidate)
+				and (candidate:IsA("Model") or candidate:IsA("Folder")) then
+
+				local ownerId = candidate:GetAttribute("OwnerUserId")
+					or candidate:GetAttribute("OwnerId")
+					or candidate:GetAttribute("UserId")
+				local ownerName = candidate:GetAttribute("OwnerName")
+					or candidate:GetAttribute("Owner")
+
+				if tonumber(ownerId) == Player.UserId
+					or tostring(ownerName or "") == Player.Name
+					or tostring(ownerName or "") == Player.DisplayName then
+					return candidate
+				end
+			end
+		end
+	end
+
+	-- Final plot resolver: nearest sizable Model in Workspace.Plots.
+	local hrp = char and char:FindFirstChild("HumanoidRootPart")
+	if plots and hrp then
+		local best, bestDistance = nil, math.huge
+		for _, candidate in ipairs(plots:GetChildren()) do
+			if not SpawnPet_IsInvalidPlotCandidate(candidate) and candidate:IsA("Model") then
+				local ok, cf = pcall(function() return candidate:GetBoundingBox() end)
+				if ok and cf then
+					local d = (cf.Position - hrp.Position).Magnitude
+					if d < bestDistance then
+						best, bestDistance = candidate, d
+					end
+				end
+			end
+		end
+		if best and bestDistance < 300 then return best end
+	end
+
+	return nil
+end
+
+local function SpawnPet_GetPlacementRay()
+	local camera = Workspace and Workspace.CurrentCamera
+	if camera and UserInputService then
+		local pos = UserInputService:GetMouseLocation()
+		local ray = camera:ScreenPointToRay(pos.X, pos.Y)
+		local params = RaycastParams.new()
+		params.FilterType = Enum.RaycastFilterType.Exclude
+		params.FilterDescendantsInstances = {Player.Character}
+		params.IgnoreWater = true
+		local result = Workspace:Raycast(ray.Origin, ray.Direction * 2000, params)
+		if result then return result.Instance, CFrame.new(result.Position) end
+	end
+
+	local mouse = Player:GetMouse()
+	if mouse and mouse.Target and mouse.Hit then return mouse.Target, mouse.Hit end
+	return nil, nil
+end
+
+local function SpawnPet_DescendantOwnerId(inst)
+	local cur = inst
+	for _ = 1, 8 do
+		if not cur then break end
+		local ownerId = cur:GetAttribute("OwnerUserId")
+			or cur:GetAttribute("OwnerId")
+			or cur:GetAttribute("UserId")
+		if tonumber(ownerId) == Player.UserId then
+			return true
+		end
+		cur = cur.Parent
+	end
+	return false
+end
+
+local function SpawnPet_GetPlacementFloorY(plot, point)
+	if not point then return nil end
+
+	if plot then
+		local params = RaycastParams.new()
+		params.FilterType = Enum.RaycastFilterType.Include
+		params.FilterDescendantsInstances = {plot}
+		params.IgnoreWater = true
+
+		local topY = math.max(point.Y + 250, 300)
+		local result = Workspace:Raycast(
+			Vector3.new(point.X, topY, point.Z),
+			Vector3.new(0, -800, 0),
+			params
+		)
+		if result and result.Normal.Y > 0.35 then
+			return result.Position.Y
+		end
+	end
+
+	-- Fallback to the exact clicked surface when the plot's floor is not queryable.
+	return point.Y
+end
+
+local function SpawnPet_GetRootBounds(root)
+	if not root then return nil end
+	local minV = Vector3.new(math.huge, math.huge, math.huge)
+	local maxV = Vector3.new(-math.huge, -math.huge, -math.huge)
+	local count = 0
+
+	local function addPart(part)
+		local cf = part.CFrame
+		local half = part.Size * 0.5
+		local corners = {
+			Vector3.new(-half.X,-half.Y,-half.Z), Vector3.new(-half.X,-half.Y,half.Z),
+			Vector3.new(-half.X,half.Y,-half.Z), Vector3.new(-half.X,half.Y,half.Z),
+			Vector3.new(half.X,-half.Y,-half.Z), Vector3.new(half.X,-half.Y,half.Z),
+			Vector3.new(half.X,half.Y,-half.Z), Vector3.new(half.X,half.Y,half.Z),
+		}
+		for _, localCorner in ipairs(corners) do
+			local world = cf:PointToWorldSpace(localCorner)
+			minV = Vector3.new(math.min(minV.X,world.X), math.min(minV.Y,world.Y), math.min(minV.Z,world.Z))
+			maxV = Vector3.new(math.max(maxV.X,world.X), math.max(maxV.Y,world.Y), math.max(maxV.Z,world.Z))
+		end
+		count += 1
+	end
+
+	if root:IsA("BasePart") then addPart(root) end
+	for _, obj in ipairs(root:GetDescendants()) do
+		if obj:IsA("BasePart") then addPart(obj) end
+	end
+	if count == 0 then return nil end
+	return minV, maxV
+end
+
+local function SpawnPet_PointInsidePlotBounds(plot, point, padding)
+	if not plot or not point then return false end
+	local minV, maxV = SpawnPet_GetRootBounds(plot)
+	if not minV or not maxV then return false end
+	padding = tonumber(padding) or 0
+	return point.X >= minV.X-padding and point.X <= maxV.X+padding
+		and point.Z >= minV.Z-padding and point.Z <= maxV.Z+padding
+end
+
+local function SpawnPet_ClampPointToPlot(plot, point, padding)
+	if not plot or not point then return point end
+	local minV, maxV = SpawnPet_GetRootBounds(plot)
+	if not minV or not maxV then return point end
+	padding = tonumber(padding) or 1.0
+	return Vector3.new(
+		math.clamp(point.X, minV.X + padding, maxV.X - padding),
+		point.Y,
+		math.clamp(point.Z, minV.Z + padding, maxV.Z - padding)
+	)
+end
+
+local function SpawnPet_GetBottomOffsetFromPivot(model)
+	if not model or not model:IsA("Model") then return 0 end
+	local ok, pivot, bboxCF, bboxSize = pcall(function()
+		local p = model:GetPivot()
+		local bcf, bsize = model:GetBoundingBox()
+		return p, bcf, bsize
+	end)
+	if not ok or not pivot or not bboxCF or not bboxSize then
+		return 0
+	end
+
+	local bottomY = bboxCF.Position.Y - (bboxSize.Y * 0.5)
+	return pivot.Position.Y - bottomY
+end
+
+local function SpawnPet_AnchorPlacedVisual(model)
+	for _, obj in ipairs(model:GetDescendants()) do
+		if obj:IsA("BasePart") then
+			pcall(function()
+				obj.Anchored = true
+				obj.CanCollide = false
+				obj.CanTouch = false
+				obj.CanQuery = false
+				obj.Massless = true
+				obj.LocalTransparencyModifier = 0
+			end)
+		end
+	end
+end
+
+local function SpawnPet_ReleaseHotbarTool(tool)
+	local slot = SpawnPetState.ToolToSlot and SpawnPetState.ToolToSlot[tool]
+	if not slot then return end
+
+	local connection = SpawnPetState.HotbarBindings and SpawnPetState.HotbarBindings[slot]
+	if connection then
+		pcall(function() connection:Disconnect() end)
+	end
+	if SpawnPetState.HotbarBindings then
+		SpawnPetState.HotbarBindings[slot] = nil
+	end
+
+	local original = SpawnPetState.HotbarOriginals and SpawnPetState.HotbarOriginals[slot]
+	if original and slot.Parent then
+		SpawnPet_HotbarDestroyTopLevelReplica(slot, true)
+		SpawnPet_RemoveHotbarMutationSiblings(slot)
+		local icon = slot:FindFirstChild("Icon", true)
+		if icon and SpawnPetState.HotbarMutationMetaByIcon then
+			SpawnPetState.HotbarMutationMetaByIcon[icon] = nil
+			if SpawnPetState.ControlPanelIconBySlot then
+				SpawnPetState.ControlPanelIconBySlot[slot] = nil
+			end
+			if SpawnPetState.ControlPanelSnapshotBySlot then
+				local snap = SpawnPetState.ControlPanelSnapshotBySlot[slot]
+				if snap and snap.replica then
+					pcall(function() snap.replica:Destroy() end)
+				end
+				SpawnPetState.ControlPanelSnapshotBySlot[slot] = nil
+			end
+			SpawnPetState.HotbarMutationRendering[icon] = nil
+			local c = SpawnPetState.HotbarMutationIconConnections
+				and SpawnPetState.HotbarMutationIconConnections[icon]
+			if c then
+				pcall(function() c:Disconnect() end)
+				SpawnPetState.HotbarMutationIconConnections[icon] = nil
+			end
+		end
+		if icon and (icon:IsA("ImageLabel") or icon:IsA("ImageButton")) then
+			SpawnPet_V33ClearMutationVisualChildren(icon)
+			pcall(function() icon.Image = original.icon or "" end)
+		end
+		local tip = slot:FindFirstChild("ToolTip", true)
+		if tip and (tip:IsA("TextLabel") or tip:IsA("TextButton")) then
+			pcall(function() tip.Text = original.tooltip or "" end)
+		end
+		pcall(function() slot:SetAttribute("__SpawnPetOccupied", nil) end)
+		pcall(function() slot:SetAttribute("__SpawnPetName", nil) end)
+		SpawnPetState.HotbarOriginals[slot] = nil
+	end
+
+	if SpawnPetState.ControlPanelVisualBySlot then
+		SpawnPetState.ControlPanelVisualBySlot[slot] = nil
+	end
+	if SpawnPetState.ControlPanelVisualByTool then
+		SpawnPetState.ControlPanelVisualByTool[tool] = nil
+	end
+	if SpawnPetState.ToolToSlot then SpawnPetState.ToolToSlot[tool] = nil end
+end
+
+local function SpawnPet_RemoveTrackedTool(tool)
+	local list = SpawnPetState.SpawnedTools
+	if type(list) ~= "table" then return end
+	for i = #list, 1, -1 do
+		if list[i] == tool then
+			table.remove(list, i)
+		end
+	end
+end
+
+-- ================================================================
+-- v24 EXACT GAME MOVEMENT ENGINE
+-- Reuses the game's own client movement modules instead of a custom
+-- random Heartbeat wanderer.
+--
+-- Verified from the supplied decompile report:
+--   AssetWanderSimulator.new(seed, owner, assetArea, itemData,
+--       isFirstPlacement, greetingOrbitRadius, jumpHeightFactor)
+--   AssetMovementBatch.new()
+--   AssetMovementBatch:Add(model, {primaryPart}, initialCFrame,
+--       bottomLocalY, assetArea, isLocalOwner, stepCallback)
+--   AssetWanderSimulator:Step(dt, simulationCFrame)
+-- returns:
+--   targetCFrame, isMoving, isGrounded, walkSpeed, greetingActive, bubbleText
+-- ================================================================
+
+SpawnPetState.PlacedVisuals = SpawnPetState.PlacedVisuals or {}
+SpawnPetState.PlacementConnections = SpawnPetState.PlacementConnections or {}
+SpawnPetState.PlacementCooldownUntil = tonumber(SpawnPetState.PlacementCooldownUntil) or 0
+SpawnPetState.RealMovementBatch = SpawnPetState.RealMovementBatch or nil
+SpawnPetState.RealMovementReady = false
+
+local SpawnPet_RealMovementModules = nil
+local SpawnPet_RealMovementInitAttempted = false
+
+local function SpawnPet_GetRealMovementModules()
+	if SpawnPet_RealMovementModules then
+		return SpawnPet_RealMovementModules
+	end
+	if SpawnPet_RealMovementInitAttempted then
+		return nil
+	end
+	SpawnPet_RealMovementInitAttempted = true
+
+	local ok, result = pcall(function()
+		local controller = Player:WaitForChild("PlayerScripts")
+			:WaitForChild("Game")
+			:WaitForChild("Plots")
+			:WaitForChild("ActiveAssetsController")
+
+		local AssetWanderSimulator = require(controller:WaitForChild("AssetWanderSimulator"))
+		local AssetMovementBatch = require(controller:WaitForChild("AssetMovementBatch"))
+		local AssetComponent = require(controller:WaitForChild("AssetComponent"))
+		local AssetBillboardController = require(controller:WaitForChild("AssetBillboardController"))
+		local AssetRoster = require(ReplicatedStorage.Client.AssetRoster)
+		local Assets = require(ReplicatedStorage.Data.Assets)
+		local Spatial = require(ReplicatedStorage.Shared.Utils.Spatial)
+		local ModelBounds = Spatial.ModelBounds
+
+		assert(type(AssetWanderSimulator) == "table" and type(AssetWanderSimulator.new) == "function", "AssetWanderSimulator.new unavailable")
+		assert(type(AssetMovementBatch) == "table" and type(AssetMovementBatch.new) == "function", "AssetMovementBatch.new unavailable")
+		assert(type(AssetComponent) == "table" and type(AssetComponent.new) == "function", "AssetComponent.new unavailable")
+		assert(type(AssetBillboardController) == "table" and type(AssetBillboardController.new) == "function", "AssetBillboardController.new unavailable")
+		assert(type(AssetRoster) == "table" and type(AssetRoster.FindPenArea) == "function", "AssetRoster.FindPenArea unavailable")
+		assert(type(Assets) == "table" and type(Assets.Directory) == "table", "Assets.Directory unavailable")
+		assert(type(ModelBounds) == "function", "ModelBounds unavailable")
+
+		return {
+			AssetWanderSimulator = AssetWanderSimulator,
+			AssetMovementBatch = AssetMovementBatch,
+			AssetComponent = AssetComponent,
+			AssetBillboardController = AssetBillboardController,
+			AssetRoster = AssetRoster,
+			Assets = Assets,
+			ModelBounds = ModelBounds,
+		}
+	end)
+
+	if not ok then
+		warn("[PETBASE v24] real movement modules unavailable: " .. tostring(result))
+		return nil
+	end
+
+	SpawnPet_RealMovementModules = result
+	return result
+end
+
+local function SpawnPet_GetRealAssetArea(mods)
+	if not mods or not mods.AssetRoster then return nil end
+	local ok, area = pcall(function()
+		return mods.AssetRoster.FindPenArea(Player)
+	end)
+	if ok and area and area:IsA("BasePart") then
+		return area
+	end
+	return nil
+end
+
+local function SpawnPet_PreparePlacedModelPhysics(wrapper, fallbackModel)
+	local root = wrapper.PrimaryPart
+	if not (root and root:IsA("BasePart")) then
+		root = wrapper:FindFirstChild("HumanoidRootPart", true)
+	end
+	if not (root and root:IsA("BasePart")) and fallbackModel and fallbackModel:IsA("Model") then
+		root = fallbackModel.PrimaryPart
+	end
+	if not (root and root:IsA("BasePart")) then
+		root = wrapper:FindFirstChild("Root", true)
+	end
+	if not (root and root:IsA("BasePart")) then return nil end
+
+	pcall(function() wrapper.PrimaryPart = root end)
+
+	for _, obj in ipairs(wrapper:GetDescendants()) do
+		if obj:IsA("BasePart") then
+			pcall(function() obj.Anchored = false end)
+			pcall(function() obj.CanCollide = false end)
+			pcall(function() obj.CanTouch = false end)
+			pcall(function() obj.CanQuery = false end)
+			pcall(function() obj.Massless = true end)
+			pcall(function() obj.AssemblyLinearVelocity = Vector3.zero end)
+			pcall(function() obj.AssemblyAngularVelocity = Vector3.zero end)
+		end
+	end
+
+	return root
+end
+
+local function SpawnPet_CalcRealMovementMetrics(wrapper, mods)
+	local boundsCF, boundsSize = mods.ModelBounds(wrapper)
+	local pivot = wrapper:GetPivot()
+	local bottomLocalY = pivot:PointToObjectSpace(boundsCF.Position).Y - boundsSize.Y * 0.5
+	local greetingOrbitRadius = 2.5 + boundsSize.Z * 0.5 * 0.8
+	local v27 = (math.max(boundsSize.Y, 4.5) / 4.5) ^ 0.7
+	local v28 = (math.max(boundsSize.X, boundsSize.Z) - 5.625) / 4.5
+	local jumpHeightFactor = v27 + math.max(v28, 0) ^ 0.65 * 1.15
+	return bottomLocalY, greetingOrbitRadius, jumpHeightFactor
+end
+
+local function SpawnPet_StopAllAnimationTracks(animator)
+	if not animator then return end
+	pcall(function()
+		for _, track in ipairs(animator:GetPlayingAnimationTracks()) do
+			track:Stop(0)
+		end
+	end)
+end
+
+local function SpawnPet_SetupRealAnimations(wrapper, category)
+	local mods = SpawnPet_GetRealMovementModules()
+	if not mods then return nil end
+
+	local directory = mods.Assets.Directory[category]
+	if type(directory) ~= "table" then return nil end
+	local animations = directory.Animations
+	if type(animations) ~= "table" then return nil end
+	local idleAnimation = animations.Idle
+	local walkAnimation = animations.Walk
+	if idleAnimation == nil or walkAnimation == nil then return nil end
+
+	local animator
+	for _, obj in ipairs(wrapper:GetDescendants()) do
+		if obj:IsA("Animator") then
+			animator = obj
+			break
+		end
+	end
+	if not animator then
+		local controller = wrapper:FindFirstChildWhichIsA("AnimationController", true)
+		if controller then
+			animator = controller:FindFirstChildWhichIsA("Animator")
+			if not animator then
+				animator = Instance.new("Animator")
+				animator.Parent = controller
+			end
+		end
+	end
+	if not animator then return nil end
+
+	SpawnPet_StopAllAnimationTracks(animator)
+
+	local idleTrack = nil
+	local walkTrack = nil
+	local okIdle = pcall(function()
+		idleTrack = animator:LoadAnimation(idleAnimation)
+	end)
+	local okWalk = pcall(function()
+		walkTrack = animator:LoadAnimation(walkAnimation)
+	end)
+	if not okIdle or not okWalk or not idleTrack or not walkTrack then return nil end
+
+	idleTrack.Looped = true
+	walkTrack.Looped = true
+
+	return {
+		Animator = animator,
+		Idle = idleTrack,
+		Walk = walkTrack,
+		Current = nil,
+		ReferenceSpeed = tonumber(directory.WalkAnimationReferenceSpeed) or 8,
+		Fade = tonumber(animations.TransitionFadeDuration) or 0.35,
+		AlwaysWalk = tonumber(animations.TransitionFadeDuration) == 0,
+		IdleTransitionRemaining = 0,
+	}
+end
+
+local function SpawnPet_PlayRealTrack(anim, track)
+	if not anim or not track then return end
+	if anim.Current == track then return end
+	if anim.Current ~= nil then
+		pcall(function() anim.Current:Stop(anim.Fade or 0.35) end)
+	end
+	anim.Current = track
+	pcall(function() track:Play(anim.Fade or 0.5) end)
+end
+
+local function SpawnPet_WalkAnimationSpeed(anim, walkSpeed)
+	return math.clamp((tonumber(walkSpeed) or 0) / (anim and anim.ReferenceSpeed or 8), 0.3, 5)
+end
+
+local function SpawnPet_UpdateRealAnimation(info, dt, isMoving, walkSpeed)
+	local anim = info and info.Animation
+	if not anim then return end
+	local idleTrack = anim.Idle
+	local walkTrack = anim.Walk
+	if not idleTrack or not walkTrack then return end
+
+	if anim.AlwaysWalk then
+		anim.IdleTransitionRemaining = 0
+		SpawnPet_PlayRealTrack(anim, walkTrack)
+		pcall(function() walkTrack:AdjustSpeed(walkSpeed and SpawnPet_WalkAnimationSpeed(anim, walkSpeed) or 0) end)
+		return
+	end
+
+	if isMoving then
+		anim.IdleTransitionRemaining = 0.28
+		SpawnPet_PlayRealTrack(anim, walkTrack)
+		pcall(function() walkTrack:AdjustSpeed(SpawnPet_WalkAnimationSpeed(anim, walkSpeed)) end)
+		return
+	end
+
+	if anim.Current ~= walkTrack or anim.IdleTransitionRemaining <= 0 then
+		SpawnPet_PlayRealTrack(anim, idleTrack)
+		pcall(function() idleTrack:AdjustSpeed(1) end)
+		return
+	end
+
+	anim.IdleTransitionRemaining = math.max(anim.IdleTransitionRemaining - dt, 0)
+	pcall(function() walkTrack:AdjustSpeed(SpawnPet_WalkAnimationSpeed(anim, walkSpeed)) end)
+end
+
+local function SpawnPet_StartExactGameMovement(wrapper, visualModel, meta, assetItem, initialCFrame)
+	-- v25: call the game's actual AssetComponent constructor with the exact
+	-- argument order captured from the live client:
+	-- AssetComponent.new(runtimeRecord, owner, assetArea, clientFolder,
+	--                     billboardController, movementBatch, initialCFrame)
+	-- This lets the game's own component create the visual model, animation,
+	-- walk sounds, idle sounds, greeting FX, chat bubble and movement callback.
+	local mods = SpawnPet_GetRealMovementModules()
+	if not mods then return false, "real-movement-modules-unavailable" end
+
+	local assetArea = SpawnPet_GetRealAssetArea(mods)
+	if not assetArea then return false, "AssetRoster.FindPenArea returned nil" end
+
+	local clientRenderedAssets = Workspace:FindFirstChild("ClientRenderedAssets")
+	if not clientRenderedAssets then
+		clientRenderedAssets = Instance.new("Folder")
+		clientRenderedAssets.Name = "ClientRenderedAssets"
+		clientRenderedAssets.Parent = Workspace
+	end
+
+	if type(assetItem) ~= "table" then
+		assetItem = SpawnPet_BuildAuthoritativeAssetItem(SpawnPetState.Source, meta or {}, nil)
+	end
+	if type(assetItem) ~= "table" then return false, "asset-item-unavailable" end
+
+	-- The live RuntimeAssetRecord captured by v9.3 contains these fields.
+	-- Keep ItemData limited to the observed runtime shape instead of adding UI-only
+	-- fields such as BaseMutation or CreatorTemporary.
+	local mutations = SpawnPet_ParseMutationList(assetItem.Mutations)
+	local itemData = {
+		Category = tostring(assetItem.Category or (meta and meta.category) or (meta and meta.name) or ""),
+		ColorIndex = tonumber(assetItem.ColorIndex),
+		ColorSeed = tonumber(assetItem.ColorSeed),
+		EyeColor = assetItem.EyeColor,
+		Gender = assetItem.Gender,
+		HasBeenFirstPlaced = assetItem.HasBeenFirstPlaced ~= false,
+		InFuse = assetItem.InFuse == true,
+		Mutations = mutations,
+		Personality = tostring(assetItem.Personality or (meta and meta.personality) or "Normal"),
+		Scale = tonumber(assetItem.Scale) or tonumber(meta and meta.scale) or 1,
+	}
+	if itemData.ColorIndex == nil then itemData.ColorIndex = 0 end
+	if itemData.ColorSeed == nil then itemData.ColorSeed = math.random(1, 2147483646) end
+	if itemData.EyeColor == nil then itemData.EyeColor = tostring(meta and meta.eyeColor or "ffffff") end
+	if itemData.Gender == nil then itemData.Gender = tostring(meta and meta.gender or "Female") end
+
+	local rate = tonumber(meta and meta.perSecondValue)
+		or tonumber(meta and meta.earningRate)
+		or tonumber(assetItem.MoneyPerSecond)
+		or 0
+
+	local uid = HttpService:GenerateGUID(false):gsub("%-", ""):lower()
+	local seed = math.random(1, 2147483646)
+
+	local runtimeRecord = {
+		OwnerUserId = Player.UserId,
+		UID = uid,
+		Seed = seed,
+		MoneyPerSecond = rate,
+		ItemData = itemData,
+		-- Intentionally omit IsFirstPlacement here. The captured live call sent
+		-- false to AssetWanderSimulator.new for the observed placed pet.
+	}
+
+	local billboardController = SpawnPetState.RealBillboardController
+	if not billboardController then
+		local okBillboard, controller = pcall(function()
+			return mods.AssetBillboardController.new()
+		end)
+		if not okBillboard or type(controller) ~= "table" then
+			return false, "AssetBillboardController.new failed: " .. tostring(controller)
+		end
+		billboardController = controller
+		SpawnPetState.RealBillboardController = controller
+	end
+
+	local movementBatch = SpawnPetState.RealMovementBatch
+	if not movementBatch then
+		local okBatch, batch = pcall(function()
+			return mods.AssetMovementBatch.new()
+		end)
+		if not okBatch or type(batch) ~= "table" then
+			return false, "AssetMovementBatch.new failed: " .. tostring(batch)
+		end
+		movementBatch = batch
+		SpawnPetState.RealMovementBatch = batch
+	end
+
+	local okComponent, component = pcall(function()
+		return mods.AssetComponent.new(
+			runtimeRecord,
+			Player,
+			assetArea,
+			clientRenderedAssets,
+			billboardController,
+			movementBatch,
+			initialCFrame
+		)
+	end)
+	if not okComponent or type(component) ~= "table" then
+		return false, "AssetComponent.new failed: " .. tostring(component)
+	end
+
+	local model = nil
+	local okModel = pcall(function()
+		model = component:GetModel()
+	end)
+	if not okModel or not model or not model:IsA("Model") then
+		pcall(function() component:Destroy() end)
+		return false, "AssetComponent.GetModel failed"
+	end
+
+	-- ActiveAssetsController calls this immediately after constructing the
+	-- component. Keep the exact ordering for the visual billboard controller.
+	local okAddBillboard, billboardErr = pcall(function()
+		billboardController:Add(model, itemData, rate)
+	end)
+	if not okAddBillboard then
+		pcall(function() component:Destroy() end)
+		return false, "AssetBillboardController:Add failed: " .. tostring(billboardErr)
+	end
+
+	SpawnPetState.PlacedVisuals[model] = {
+		Wrapper = model,
+		Model = model:FindFirstChild("Model") or visualModel,
+		Component = component,
+		RuntimeRecord = runtimeRecord,
+		AssetItem = itemData,
+		Meta = meta or {},
+		MovementBatch = movementBatch,
+		BillboardController = billboardController,
+		UID = uid,
+		Started = os.clock(),
+		ExactComponent = true,
+	}
+
+	return true, SpawnPetState.PlacedVisuals[model]
+end
+
+local function SpawnPet_RemoveExactGameMovement(wrapper)
+	local info = SpawnPetState.PlacedVisuals and SpawnPetState.PlacedVisuals[wrapper]
+	if not info then return end
+	if info.Component then
+		pcall(function() info.Component:Destroy() end)
+	else
+		if info.MovementBatch then
+			pcall(function() info.MovementBatch:Remove(wrapper) end)
+		end
+	end
+	SpawnPetState.PlacedVisuals[wrapper] = nil
+end
+
+-- No custom Heartbeat wanderer is used anymore. The game-owned
+-- AssetMovementBatch drives PreRender + BulkMoveTo, while AssetWanderSimulator
+-- supplies the actual destination/curve/idle/jump/greeting behavior.
+
+local function SpawnPet_IsOwnBaseClick(plot, target, point)
+	if target and Player.Character and target:IsDescendantOf(Player.Character) then
+		return false
+	end
+
+	if target and SpawnPet_DescendantOwnerId(target) then
+		return true
+	end
+
+	if plot and target and target:IsDescendantOf(plot) then
+		return true
+	end
+
+	if plot and point and SpawnPet_PointInsidePlotBounds(plot, point, 2) then
+		return true
+	end
+
+	-- If the game's plot container is not exposed to the client, allow a nearby
+	-- world surface as a client-only visual placement fallback.
+	local hrp = Player.Character and Player.Character:FindFirstChild("HumanoidRootPart")
+	if not plot and hrp and point and (point - hrp.Position).Magnitude <= 160 then
+		return true
+	end
+
+	return false
+end
+
+function SpawnPet_PlaceHeldVisual(tool, clone, meta)
+	if not tool or not tool.Parent or not clone or not clone.Parent then
+		return false, "visual-model-unavailable"
+	end
+
+	local now = os.clock()
+	if now < (SpawnPetState.PlacementCooldownUntil or 0) then
+		return false, "placement-cooldown"
+	end
+	SpawnPetState.PlacementCooldownUntil = now + 0.22
+
+	local target, hit = SpawnPet_GetPlacementRay()
+	if not target or not hit then
+		return false, "click-target-unavailable"
+	end
+
+	local plot = SpawnPet_FindOwnPlacementPlot()
+	if not plot and not SpawnPet_DescendantOwnerId(target) then
+		return false, "own-base-not-detected"
+	end
+	if not SpawnPet_IsOwnBaseClick(plot, target, hit.Position) then
+		return false, "click-inside-own-base"
+	end
+
+	local clientRenderedAssets = Workspace:FindFirstChild("ClientRenderedAssets")
+	if not clientRenderedAssets then
+		clientRenderedAssets = Instance.new("Folder")
+		clientRenderedAssets.Name = "ClientRenderedAssets"
+		clientRenderedAssets.Parent = Workspace
+	end
+
+	local point = hit.Position
+	local floorY = SpawnPet_GetPlacementFloorY(plot, point) or point.Y
+	local bottomOffset = SpawnPet_GetBottomOffsetFromPivot(clone)
+
+	local character = Player.Character
+	local hrp = character and character:FindFirstChild("HumanoidRootPart")
+	local yaw = 0
+	if hrp then
+		local look = hrp.CFrame.LookVector
+		yaw = math.atan2(-look.X, -look.Z)
+	end
+
+	local pivotPos = Vector3.new(point.X, floorY + bottomOffset + 0.08, point.Z)
+
+	local existingWeld = tool:FindFirstChild("__SpawnPetHandWeld", true)
+	if existingWeld then
+		pcall(function() existingWeld:Destroy() end)
+	end
+	local handle = tool:FindFirstChild("Handle")
+	if handle then
+		pcall(function() handle:Destroy() end)
+	end
+
+	local initialCFrame = CFrame.new(pivotPos) * CFrame.Angles(0, yaw, 0)
+
+	local assetItem = SpawnPetState.AssetItemByClone and SpawnPetState.AssetItemByClone[clone]
+	if type(assetItem) ~= "table" then
+		assetItem = SpawnPet_BuildAuthoritativeAssetItem(SpawnPetState.Source, meta, nil)
+	end
+
+	-- First try the actual game component constructor. It creates its own
+	-- ClientRenderedAssets wrapper with the observed runtime record shape.
+	local exactMoveOk, exactMoveResult = SpawnPet_StartExactGameMovement(
+		nil,
+		clone,
+		meta,
+		assetItem,
+		initialCFrame
+	)
+
+	if not exactMoveOk then
+		-- Compatibility fallback only when the live AssetComponent constructor is
+		-- unavailable. This branch keeps the old client-only visual placement alive.
+		local clientRenderedAssets = Workspace:FindFirstChild("ClientRenderedAssets")
+		if not clientRenderedAssets then
+			clientRenderedAssets = Instance.new("Folder")
+			clientRenderedAssets.Name = "ClientRenderedAssets"
+			clientRenderedAssets.Parent = Workspace
+		end
+
+		local uid = HttpService:GenerateGUID(false):gsub("%-", ""):lower()
+		local wrapper = Instance.new("Model")
+		wrapper.Name = tostring(Player.UserId) .. "_" .. uid
+		wrapper:SetAttribute("OwnerUserId", Player.UserId)
+		wrapper:SetAttribute("UID", uid)
+		wrapper:SetAttribute("VirtualPet", true)
+		wrapper:SetAttribute("PetName", tostring(meta and meta.name or tool:GetAttribute("PetName") or tool.Name))
+		wrapper:SetAttribute("PetCategory", tostring(meta and meta.category or tool:GetAttribute("PetCategory") or ""))
+		wrapper:SetAttribute("PetBPS", tostring(meta and meta.perSecond or tool:GetAttribute("PetBPS") or ""))
+		wrapper:SetAttribute("PetScale", tonumber(meta and meta.scale or tool:GetAttribute("PetScale")) or 1)
+		wrapper:SetAttribute("BaseMutation", tostring(meta and meta.baseMutation or tool:GetAttribute("PetBaseMutation") or ""))
+
+		pcall(function() clone.Name = "Model" end)
+		clone.Parent = wrapper
+		wrapper.Parent = clientRenderedAssets
+		pcall(function() clone:PivotTo(initialCFrame) end)
+		SpawnPetState.PlacedVisuals[wrapper] = {
+			Wrapper = wrapper,
+			Model = clone,
+			Meta = meta or {},
+			ExactMovementFailed = true,
+			ExactMovementError = tostring(exactMoveResult),
+		}
+		if SpawnPetState.Status then
+			SpawnPetState.Status.Text = "PLACED • EXACT COMPONENT FAILED: " .. tostring(exactMoveResult)
+		end
+	else
+		-- The exact component generated its own wrapper/model in
+		-- Workspace.ClientRenderedAssets. The held tool copy is no longer needed.
+		pcall(function() clone:Destroy() end)
+		if SpawnPetState.Status then
+			SpawnPetState.Status.Text = "PLACED • EXACT GAME COMPONENT ACTIVE"
+		end
+	end
+	local placedInfo
+	if exactMoveOk then
+		placedInfo = exactMoveResult or {}
+	else
+		placedInfo = SpawnPetState.PlacedVisuals[wrapper] or {}
+	end
+	placedInfo.Position = pivotPos
+
+	SpawnPet_ReleaseHotbarTool(tool)
+	SpawnPet_RemoveTrackedTool(tool)
+	if SpawnPetState.ToolToClone then SpawnPetState.ToolToClone[tool] = nil end
+
+	pcall(function() tool:Destroy() end)
+	SpawnPetState.PlacementConnections[tool] = nil
+
+	return true, placedInfo
+end
+
+function SpawnPet_BindVisualPlacementTool(tool, clone, meta)
+	if not tool or not clone then return end
+	if tool:GetAttribute("VirtualPet") ~= true then return end
+
+	local oldConnection = SpawnPetState.PlacementConnections[tool]
+	if oldConnection then
+		pcall(function() oldConnection:Disconnect() end)
+	end
+
+	-- Tool.Activated is the required "hold pet visual -> click base" gesture.
+	-- ManualActivationOnly must be false so normal left-click activation reaches us.
+	pcall(function() tool.ManualActivationOnly = false end)
+
+	local busy = false
+	local connection = tool.Activated:Connect(function()
+		if busy then return end
+		if not tool.Parent or not clone.Parent then return end
+
+		busy = true
+		local ok, placed, placeError = pcall(function()
+			return SpawnPet_PlaceHeldVisual(tool, clone, meta)
+		end)
+
+		if ok and placed then
+			if SpawnPetState.Status then
+				SpawnPetState.Status.Text = "PLACED IN BASE: " .. tostring(meta and meta.name or tool.Name)
+			end
+		else
+			local reason = ok and tostring(placeError or placed) or tostring(placed)
+			if reason == "click-inside-own-base" then
+				reason = "Click on a surface INSIDE your own base"
+			elseif reason == "own-base-not-detected" then
+				reason = "Own base not detected"
+			elseif reason == "click-target-unavailable" then
+				reason = "Click target unavailable"
+			elseif reason == "visual-model-unavailable" then
+				reason = "Pet visual unavailable"
+			end
+			if SpawnPetState.Status then
+				SpawnPetState.Status.Text = "PLACE PET: " .. reason
+			end
+		end
+
+		busy = false
+	end)
+
+	SpawnPetState.PlacementConnections[tool] = connection
+end
+
+do
+	local old = SpawnPetState.PlacementInputConnection
+	if old then pcall(function() old:Disconnect() end) end
+	SpawnPetState.PlacementInputConnection = UserInputService.InputBegan:Connect(function(input)
+		if input.UserInputType ~= Enum.UserInputType.MouseButton1 then return end
+		local character = Player and Player.Character
+		if not character then return end
+		local tool = character:FindFirstChildOfClass("Tool")
+		if not tool or tool:GetAttribute("VirtualPet") ~= true then return end
+		local clone = SpawnPetState.ToolToClone and SpawnPetState.ToolToClone[tool]
+		if not clone then clone = tool:FindFirstChild("Model") or tool:FindFirstChild("HeldModel") end
+		if not clone or not clone:IsA("Model") then return end
+		local meta = (SpawnPetState.MetaByTool and SpawnPetState.MetaByTool[tool]) or SpawnPetState.Meta or {}
+		task.defer(function()
+			local ok, placed, err = pcall(function() return SpawnPet_PlaceHeldVisual(tool, clone, meta) end)
+			if ok and placed then
+				if SpawnPetState.Status then SpawnPetState.Status.Text = "PLACED IN BASE: " .. tostring(meta.name or tool.Name) end
+			elseif SpawnPetState.Status and ok then
+				local reason=tostring(err or placed)
+				if reason=="click-inside-own-base" then reason="Click inside your base" end
+				if reason=="own-base-not-detected" then reason="Base not detected" end
+				SpawnPetState.Status.Text="PLACE PET: "..reason
+			end
+		end)
+	end)
 end
 
 function SpawnPet_CreateTool(sourceModel, meta)
@@ -3357,9 +6802,10 @@ function SpawnPet_CreateTool(sourceModel, meta)
 
 	SpawnPet_PrepareHandPhysics(clone)
 
-	-- The real AssetRigFactory already resized the rig with assetItem.Scale.
-	-- Never ScaleTo() it again on the authoritative path, otherwise its visible
-	-- proportions and its $/s would drift away from the runtime asset.
+	-- The real AssetRigFactory already applies assetItem.Scale. Keep that
+	-- authoritative scale on the base pipeline. The fallback model is scaled
+	-- locally. Held-display fitting is applied afterwards and does not replace
+	-- the pet's runtime scale value.
 	if not usedRealPipeline then
 		pcall(function() clone:ScaleTo(spawnScale) end)
 	end
@@ -3376,7 +6822,7 @@ function SpawnPet_CreateTool(sourceModel, meta)
 	tool.ToolTip=(meta.perSecond ~= "" and (tool.Name.." | "..meta.perSecond) or tool.Name)
 	tool.RequiresHandle=true
 	tool.CanBeDropped=false
-	tool.ManualActivationOnly=true
+	tool.ManualActivationOnly=false
 	tool:SetAttribute("VirtualPet", true)
 	tool:SetAttribute("PetName", meta.name)
 	meta.rarity = SpawnPet_Rarity(meta.rarity)
@@ -3389,6 +6835,7 @@ function SpawnPet_CreateTool(sourceModel, meta)
 	tool:SetAttribute("PetEarningRate", tonumber(meta.earningRate) or 0)
 	tool:SetAttribute("PetMutations", table.concat(meta.mutations or {}, ", "))
 	tool:SetAttribute("PetBaseMutation", tostring(meta.baseMutation or ""))
+	tool:SetAttribute("PetMutationOverride", tostring(meta.mutationOverride or ""))
 	tool:SetAttribute("PetObjects", #clone:GetDescendants())
 	tool:SetAttribute("SpawnPetSource", sourceModel:GetFullName())
 	tool:SetAttribute("SpawnPetBuildSource", buildSource)
@@ -3441,6 +6888,13 @@ function SpawnPet_CreateTool(sourceModel, meta)
 	handle.CFrame=root.CFrame
 	clone.Parent=tool
 
+	-- NEW: scale-safe held presentation. The model is kept fully visible when
+	-- the Size value is reduced, while the real game rig and base placement
+	-- continue using the same AssetItem scale.
+	pcall(function()
+		SpawnPet_ApplyHeldFullDisplay(tool, clone, root, height)
+	end)
+
 	-- Create the game's own overhead card first. It uses the actual
 	-- AssetInfoBillboard.Attach pipeline, including the game's rarity/display
 	-- formatting and exact PerSecond field. Fallback to the legacy repaired
@@ -3467,22 +6921,86 @@ function SpawnPet_CreateTool(sourceModel, meta)
 	tool.Equipped:Connect(function()
 		task.defer(function()
 			if tool.Parent and clone.Parent then
+				pcall(function() SpawnPet_ApplyHeldFullDisplay(tool, clone, root, height) end)
 				pcall(function() SpawnPet_BuildNameplate(clone, meta) end)
+				pcall(function() SpawnPet_RestartHeldAnimation(tool, clone, meta) end)
 			end
 		end)
 	end)
 
-	if realPose and realPose.grip then
-		pcall(function() tool.Grip=realPose.grip * CFrame.new(0,height,0) end)
-	else
-		pcall(function() tool.Grip=CFrame.new(0,height,0) end)
-	end
+	-- Re-apply the scale-safe grip after billboard creation, because the real
+	-- billboard module can alter attachments during construction.
+	pcall(function()
+		SpawnPet_ApplyHeldFullDisplay(tool, clone, root, height)
+	end)
+
+	-- Equip-time placement: while this VirtualPet tool is held, a normal left-click
+	-- on the player's own base places the existing visual Model into the garden.
+	SpawnPet_BindVisualPlacementTool(tool, clone, meta)
 
 	tool.Parent=backpack
 	-- Keep all spawned pets in Backpack; hotbar buttons equip them on click.
 	SpawnPetState.SpawnedTools[#SpawnPetState.SpawnedTools+1]=tool
+	tool:SetAttribute("SpawnPetOrder", #SpawnPetState.SpawnedTools)
 	SpawnPetState.ToolToClone=SpawnPetState.ToolToClone or {}
 	SpawnPetState.ToolToClone[tool]=clone
+	SpawnPetState.MetaByTool = SpawnPetState.MetaByTool or setmetatable({}, {__mode="k"})
+	SpawnPetState.MetaByTool[tool]=meta
+
+	-- Keep the held animation alive without touching placed-pet movement. This
+	-- watcher only services the VirtualPet while its Tool is inside Character.
+	SpawnPetState.HeldAnimationConnections = SpawnPetState.HeldAnimationConnections or setmetatable({}, {__mode="k"})
+	local oldAnimConn = SpawnPetState.HeldAnimationConnections[tool]
+	if oldAnimConn then pcall(function() oldAnimConn:Disconnect() end) end
+	SpawnPetState.HeldAnimationConnections[tool] = RunService.Heartbeat:Connect(function()
+		local character = Player and Player.Character
+		if not tool.Parent or not clone.Parent then
+			local c = SpawnPetState.HeldAnimationConnections[tool]
+			if c then pcall(function() c:Disconnect() end) end
+			SpawnPetState.HeldAnimationConnections[tool] = nil
+			return
+		end
+		if character and tool.Parent == character and clone:IsDescendantOf(tool) then
+			local track = SpawnPetState.AnimationTrackByClone and SpawnPetState.AnimationTrackByClone[clone]
+			local playing = false
+			if track then pcall(function() playing = track.IsPlaying end) end
+			if not playing then
+				pcall(function() SpawnPet_PlayAnimation1(clone, meta) end)
+			end
+		end
+	end)
+
+	-- Live SizeBox changes: preserve the entire held pet instead of allowing a
+	-- tiny/partial model presentation. For the authoritative rig, ScaleTo is
+	-- used only when the requested absolute model scale differs from its current
+	-- scale; the stored PetScale attribute is kept in sync.
+	local heldScaleConn = SpawnPetState.HeldScaleConnections and SpawnPetState.HeldScaleConnections[tool]
+	if heldScaleConn then pcall(function() heldScaleConn:Disconnect() end) end
+	SpawnPetState.HeldScaleConnections = SpawnPetState.HeldScaleConnections or setmetatable({}, {__mode="k"})
+	SpawnPetState.HeldScaleConnections[tool] = SpawnPetState.SizeBox.FocusLost:Connect(function()
+		if not tool.Parent or not clone.Parent then return end
+		local requested = SpawnPet_GetNumber(SpawnPetState.SizeBox, spawnScale)
+		requested = math.clamp(requested, 0.05, 10)
+		local cur = nil
+		pcall(function() cur = clone:GetScale() end)
+		if not cur or cur <= 0 then cur = requested end
+		if math.abs(cur-requested) > 0.001 then
+			pcall(function() clone:ScaleTo(requested) end)
+		end
+		tool:SetAttribute("PetScale", requested)
+		pcall(function() SpawnPet_ApplyHeldFullDisplay(tool, clone, root, height) end)
+		pcall(function() SpawnPet_BuildNameplate(clone, meta) end)
+		pcall(function() SpawnPet_RestartHeldAnimation(tool, clone, meta) end)
+	end)
+
+	tool.AncestryChanged:Connect(function(_, parent)
+		if not parent and SpawnPetState.HeldScaleConnections then
+			local conn = SpawnPetState.HeldScaleConnections[tool]
+			if conn then pcall(function() conn:Disconnect() end) end
+			SpawnPetState.HeldScaleConnections[tool] = nil
+		end
+	end)
+
 	return tool, clone
 end
 
@@ -3490,7 +7008,11 @@ function SpawnPet_UpdatePreview(meta)
     meta = meta or {}
     meta.rarity = SpawnPet_Rarity(meta.rarity)
     SpawnPetState.Meta = meta
-    if SpawnPetState.NameLabel then SpawnPetState.NameLabel.Text = meta.name end
+
+    if SpawnPetState.NameLabel then
+        SpawnPetState.NameLabel.Text = meta.name
+    end
+
     if SpawnPetState.RarityLabel then
         SpawnPetState.RarityLabel.Text = meta.rarity
         SpawnPetState.RarityLabel.Visible = meta.rarity ~= ""
@@ -3499,9 +7021,53 @@ function SpawnPet_UpdatePreview(meta)
             SpawnPet_ApplyAuthoritativeRarityVisual(SpawnPetState.RarityLabel, meta.rarity)
         end
     end
-    if SpawnPetState.RateLabel then SpawnPetState.RateLabel.Text = meta.perSecond or "" end
-    if SpawnPetState.Icon then SpawnPetState.Icon.Image = meta.image ~= "" and meta.image or "" end
-    if SpawnPetState.Status then SpawnPetState.Status.Text = (meta.name ~= "" and "Found: " .. meta.name .. " • " .. meta.rarity or "Pet not found") end
+
+    if SpawnPetState.RateLabel then
+        SpawnPetState.RateLabel.Text = meta.perSecond or ""
+    end
+
+    if SpawnPetState.Icon then
+        local icon = SpawnPetState.Icon
+
+        -- Never let the mutation renderer prevent the normal preview image.
+        local ok, reason = pcall(function()
+            return SpawnPet_ApplySourceFaithfulMutationIcon(icon, meta)
+        end)
+
+        if ok and reason then
+            -- Hard guard: with Rainbow selected, the Control Panel itself must
+            -- contain the actual second visual layer before Spawn captures it.
+            if SpawnPet_HasMutationName(meta, "Rainbow") then
+                local hasRainbowLayer = false
+                for _, node in ipairs(icon:GetDescendants()) do
+                    if SpawnPet_V33Token(node.Name) == "rainbowoverlayimage" then
+                        hasRainbowLayer = true
+                        break
+                    end
+                end
+                if not hasRainbowLayer then
+                    meta.iconVisualSource = "ERROR:Rainbow-selected-but-overlay-missing"
+                else
+                    meta.iconVisualSource = tostring(reason)
+                end
+            else
+                meta.iconVisualSource = tostring(reason)
+            end
+        else
+            pcall(function()
+                SpawnPet_ClearExactMutationIconVisual(icon)
+                icon.Image = tostring(meta.image or "")
+                icon.ImageTransparency = 0
+                icon.ScaleType = Enum.ScaleType.Fit
+            end)
+            meta.iconVisualSource = "base-icon-fallback:" .. tostring(reason or "renderer-error")
+        end
+    end
+
+    if SpawnPetState.Status then
+        SpawnPetState.Status.Text =
+            (meta.name ~= "" and "Found: " .. meta.name .. " • " .. meta.rarity or "Pet not found")
+    end
 end
 
 function SpawnPet_Search(query)
@@ -3527,6 +7093,11 @@ function SpawnPet_Search(query)
         scale=model and tonumber(SpawnPet_ReadSourcePetField(model, "Scale", nil)) or nil,
         mutations=model and SpawnPet_ParseMutationList(SpawnPet_ReadSourcePetField(model, "Mutations", "")) or {},
         baseMutation=model and SpawnPet_ReadSourcePetField(model, "BaseMutation", nil) or nil,
+        colorSeed=model and tonumber(SpawnPet_ReadSourcePetField(model, "ColorSeed", nil)) or nil,
+        colorIndex=model and SpawnPet_ReadSourcePetField(model, "ColorIndex", nil) or nil,
+        eyeColor=model and SpawnPet_ReadSourcePetField(model, "EyeColor", nil) or nil,
+        personality=model and SpawnPet_ReadSourcePetField(model, "Personality", nil) or nil,
+        gender=model and SpawnPet_ReadSourcePetField(model, "Gender", nil) or nil,
         creatorTemporary=model and (SpawnPet_ReadSourcePetField(model, "CreatorTemporary", false) == true) or false,
         hasBeenFirstPlaced=model and (SpawnPet_ReadSourcePetField(model, "HasBeenFirstPlaced", true) ~= false) or true,
         earningRate=0,
@@ -3559,6 +7130,9 @@ function SpawnPet_Search(query)
     -- Re-apply authoritative values after all legacy fallbacks so they cannot
     -- overwrite the real game values.
     meta = SpawnPet_ApplyAuthoritativePetData(model, meta, meta.scale)
+    meta = SpawnPet_ApplyMutationSelection(meta)
+    meta = SpawnPet_ApplyAuthoritativePetData(model, meta, meta.scale)
+    meta = SpawnPet_ApplyMutationSelection(meta)
 
     if token ~= SpawnPetState.SearchToken then return end
     SpawnPetState.Source = model
@@ -3569,6 +7143,39 @@ function SpawnPet_Search(query)
         "rate=", meta.perSecond,
         "rateSource=", meta.rateSource)
 end
+
+
+function SpawnPet_ConfirmSearch()
+	local query = SpawnPet_Normalize(
+		SpawnPetState.SearchBox and SpawnPetState.SearchBox.Text or ""
+	)
+	if query == "" then
+		if SpawnPetState.Status then
+			SpawnPetState.Status.Text = "Enter a Pet name, choose mutations, then press CONFIRM / FIND PET"
+		end
+		return false
+	end
+
+	-- Commit the currently selected mutations ONLY when the user confirms.
+	SpawnPetState.ConfirmedMutations = {}
+	for _, mutationName in ipairs(SpawnPet_GetSelectedMutationList()) do
+		SpawnPetState.ConfirmedMutations[string.lower(mutationName)] = true
+	end
+
+	if SpawnPetState.Status then
+		SpawnPetState.Status.Text =
+			"Finding: " .. query .. " • Mutation: " .. SpawnPet_GetSelectedMutationText()
+	end
+
+	SpawnPet_Search(query)
+
+	-- Search is asynchronous, so mark the visual state after the search request.
+	if SpawnPetState.MutationSelectionLabel then
+		SpawnPetState.MutationSelectionLabel.Text = "Confirmed: " .. SpawnPet_GetSelectedMutationText()
+	end
+	return true
+end
+
 
 function SpawnPet_SpawnCurrent()
     local source=SpawnPetState.Source
@@ -3581,7 +7188,9 @@ function SpawnPet_SpawnCurrent()
     local sizeInput = SpawnPet_GetNumber(SpawnPetState.SizeBox,1)
     local runtimeScale = tonumber(meta.scale) or 1
     local spawnScale = (math.abs(sizeInput - 1) < 0.000001) and runtimeScale or math.clamp(sizeInput,0.05,10)
+    meta=SpawnPet_ApplyMutationSelection(meta)
     meta=SpawnPet_ApplyAuthoritativePetData(source,meta,spawnScale)
+    meta=SpawnPet_ApplyMutationSelection(meta)
     SpawnPetState.Meta=meta
     SpawnPet_UpdatePreview(meta)
 
@@ -3596,12 +7205,20 @@ function SpawnPet_SpawnCurrent()
         if SpawnPetState.Status then SpawnPetState.Status.Text="Spawn failed" end
         return
     end
+	tool:SetAttribute("VirtualPetClientOnly", true)
+	tool:SetAttribute("VirtualPetServerSynced", false)
+
+	-- Save the Control Panel visual for this Tool before any later Hotbar refill.
+	pcall(function() SpawnPet_CaptureControlPanelVisualForTool(tool, meta) end)
 
     local slot=SpawnPet_FindFreeHotbarSlot()
     if slot then
-        pcall(function()
-            SpawnPet_BindHotbarSlot(slot,tool,meta,meta.image)
-        end)
+		-- The active Hotbar renderer is SpawnPet_HotbarRenderExactMutation().
+		-- meta.image remains the authoritative normal-pet fallback string.
+		local hotbarIconId = meta.image
+		pcall(function()
+			SpawnPet_BindHotbarSlot(slot, tool, meta, hotbarIconId)
+		end)
         tool:SetAttribute("VirtualPetInventoryOnly", false)
         tool:SetAttribute("VirtualPetHotbarVisible", true)
     else
@@ -3762,9 +7379,11 @@ function SpawnPet_ClearCurrentUI()
 	if SpawnPetState.NameLabel then SpawnPetState.NameLabel.Text="" end
 	if SpawnPetState.RarityLabel then SpawnPetState.RarityLabel.Text=""; SpawnPetState.RarityLabel.Visible=false; SpawnPetState.RarityLabel.TextTransparency=1 end
 	if SpawnPetState.RateLabel then SpawnPetState.RateLabel.Text="" end
-	if SpawnPetState.Status then SpawnPetState.Status.Text="Search a Pet name and press Enter" end
+	if SpawnPetState.Status then SpawnPetState.Status.Text="Enter Pet name + choose mutations • Press CONFIRM / FIND PET" end
 	SpawnPetState.Source=nil
-	SpawnPetState.Meta={name="",rarity="",perSecond="",image="",animationId="",animationName="",category="",scale=1,mutations={},baseMutation=nil,creatorTemporary=false,hasBeenFirstPlaced=true,earningRate=0,perSecondValue=0,rarityNumber=0}
+	SpawnPetState.Meta={name="",rarity="",perSecond="",image="",animationId="",animationName="",category="",scale=1,mutations={},baseMutation=nil,mutationOverride="",creatorTemporary=false,hasBeenFirstPlaced=true,earningRate=0,perSecondValue=0,rarityNumber=0}
+	SpawnPetState.ConfirmedMutations = {}
+	SpawnPetState.SelectedMutations = {}
 end
 
 function SpawnPet_ClearSpawnedPets()
@@ -3781,10 +7400,15 @@ function SpawnPet_ClearSpawnedPets()
 			if track then pcall(function() track:Stop(0) end) end
 			SpawnPetState.AnimationTrackByClone[clone] = nil
 		end
+		if SpawnPetState.HeldAnimationConnections and SpawnPetState.HeldAnimationConnections[tool] then
+			pcall(function() SpawnPetState.HeldAnimationConnections[tool]:Disconnect() end)
+			SpawnPetState.HeldAnimationConnections[tool] = nil
+		end
 		if SpawnPetState.AssetItemByClone and clone then
 			SpawnPetState.AssetItemByClone[clone] = nil
 		end
 		SpawnPetState.ToolToClone[tool] = nil
+		if SpawnPetState.MetaByTool then SpawnPetState.MetaByTool[tool] = nil end
 		pcall(function() tool:Destroy() end)
 	end
 
@@ -3820,9 +7444,21 @@ function SpawnPet_ClearSpawnedPets()
 		end
 	end
 
+	-- Also clear client-side pets that were already placed into the garden.
+	for wrapper in pairs(SpawnPetState.PlacedVisuals or {}) do
+		SpawnPet_RemoveExactGameMovement(wrapper)
+		if wrapper and wrapper.Parent then
+			pcall(function() wrapper:Destroy() end)
+		end
+	end
+
 	for slot, connection in pairs(SpawnPetState.HotbarBindings or {}) do
 		if connection then pcall(function() connection:Disconnect() end) end
 		SpawnPetState.HotbarBindings[slot] = nil
+	end
+	for slot, connection in pairs(SpawnPetState.RainbowHotbarRepair or {}) do
+		if connection then pcall(function() connection:Disconnect() end) end
+		SpawnPetState.RainbowHotbarRepair[slot] = nil
 	end
 
 	table.clear(SpawnPetState.SpawnedTools)
@@ -3871,7 +7507,7 @@ function SpawnPet_InitUI()
 	spSearch.Position=UDim2.fromOffset(15,38)
 	spSearch.BackgroundColor3=Color3.fromRGB(40,40,45)
 	spSearch.BorderSizePixel=0
-	spSearch.PlaceholderText="Search Pet name... (Enter)"
+	spSearch.PlaceholderText="Pet name... then press CONFIRM"
 	spSearch.PlaceholderColor3=Color3.fromRGB(130,130,140)
 	spSearch.Text=""
 	spSearch.TextColor3=Color3.fromRGB(255,255,255)
@@ -3939,9 +7575,9 @@ function SpawnPet_InitUI()
 
 	local spStatus=Instance.new("TextLabel",SpawnPetState.Panel)
 	spStatus.Size=UDim2.new(1,-30,0,20)
-	spStatus.Position=UDim2.fromOffset(15,262)
+	spStatus.Position=UDim2.fromOffset(15,242)
 	spStatus.BackgroundTransparency=1
-	spStatus.Text="Search a Pet name and press Enter"
+	spStatus.Text="Enter Pet name + choose mutations • Press CONFIRM / FIND PET"
 	spStatus.TextColor3=Color3.fromRGB(155,155,165)
 	spStatus.Font=Enum.Font.Gotham
 	spStatus.TextSize=10
@@ -3949,9 +7585,98 @@ function SpawnPet_InitUI()
 	spStatus.ZIndex=1552
 	SpawnPetState.Status=spStatus
 
+	local spMutationLabel=Instance.new("TextLabel",SpawnPetState.Panel)
+	spMutationLabel.Size=UDim2.fromOffset(60,20)
+	spMutationLabel.Position=UDim2.fromOffset(15,270)
+	spMutationLabel.BackgroundTransparency=1
+	spMutationLabel.Text="Mutations"
+	spMutationLabel.TextColor3=Color3.fromRGB(210,210,215)
+	spMutationLabel.Font=Enum.Font.GothamMedium
+	spMutationLabel.TextSize=10
+	spMutationLabel.TextXAlignment=Enum.TextXAlignment.Left
+	spMutationLabel.ZIndex=1552
+
+	local spMutationSelected=Instance.new("TextLabel",SpawnPetState.Panel)
+	spMutationSelected.Size=UDim2.new(1,-82,0,20)
+	spMutationSelected.Position=UDim2.fromOffset(76,270)
+	spMutationSelected.BackgroundTransparency=1
+	spMutationSelected.Text="Selected: None"
+	spMutationSelected.TextColor3=Color3.fromRGB(145,235,125)
+	spMutationSelected.Font=Enum.Font.GothamMedium
+	spMutationSelected.TextSize=9
+	spMutationSelected.TextXAlignment=Enum.TextXAlignment.Right
+	spMutationSelected.TextTruncate=Enum.TextTruncate.AtEnd
+	spMutationSelected.ZIndex=1552
+	SpawnPetState.MutationSelectionLabel=spMutationSelected
+
+	local mutationScroll=Instance.new("ScrollingFrame",SpawnPetState.Panel)
+	mutationScroll.Name="MutationSelector"
+	mutationScroll.Size=UDim2.new(1,-30,0,72)
+	mutationScroll.Position=UDim2.fromOffset(15,292)
+	mutationScroll.BackgroundColor3=Color3.fromRGB(31,31,37)
+	mutationScroll.BorderSizePixel=0
+	mutationScroll.ScrollBarThickness=5
+	mutationScroll.ScrollBarImageColor3=Color3.fromRGB(110,110,120)
+	mutationScroll.AutomaticCanvasSize=Enum.AutomaticSize.Y
+	mutationScroll.CanvasSize=UDim2.new(0,0,0,0)
+	mutationScroll.ZIndex=1552
+	Instance.new("UICorner",mutationScroll).CornerRadius=UDim.new(0,5)
+
+	local mutationLayout=Instance.new("UIGridLayout",mutationScroll)
+	mutationLayout.CellSize=UDim2.fromOffset(58,22)
+	mutationLayout.CellPadding=UDim2.fromOffset(4,4)
+	mutationLayout.SortOrder=Enum.SortOrder.LayoutOrder
+
+	local mutationPadding=Instance.new("UIPadding",mutationScroll)
+	mutationPadding.PaddingTop=UDim.new(0,4)
+	mutationPadding.PaddingLeft=UDim.new(0,5)
+	mutationPadding.PaddingRight=UDim.new(0,5)
+	mutationPadding.PaddingBottom=UDim.new(0,4)
+
+	SpawnPetState.MutationButtons={}
+	SpawnPetState.MutationSelector=mutationScroll
+
+	local mutationCatalog=SpawnPet_ReadMutationCatalog()
+	for index, mutationName in ipairs(mutationCatalog) do
+		local btn=Instance.new("TextButton",mutationScroll)
+		btn.Name="Mutation_"..mutationName
+		btn.Size=UDim2.fromOffset(58,22)
+		btn.BackgroundColor3=Color3.fromRGB(55,57,66)
+		btn.BorderSizePixel=0
+		btn.Text=mutationName
+		btn.TextColor3=Color3.fromRGB(255,255,255)
+		btn.Font=Enum.Font.GothamBold
+		btn.TextSize=8
+		btn.AutoButtonColor=false
+		btn.ZIndex=1553
+		btn.LayoutOrder=index
+		Instance.new("UICorner",btn).CornerRadius=UDim.new(0,4)
+		SpawnPetState.MutationButtons[mutationName]=btn
+
+		btn.Activated:Connect(function()
+			SpawnPet_SetSelectedMutation(mutationName)
+		end)
+	end
+
+
+	local spConfirm=Instance.new("TextButton",SpawnPetState.Panel)
+	spConfirm.Name="ConfirmFindPetButton"
+	spConfirm.Size=UDim2.new(1,-30,0,34)
+	spConfirm.Position=UDim2.fromOffset(15,370)
+	spConfirm.BackgroundColor3=Color3.fromRGB(70,200,255)
+	spConfirm.BorderSizePixel=0
+	spConfirm.Text="CONFIRM / FIND PET"
+	spConfirm.TextColor3=Color3.fromRGB(0,0,0)
+	spConfirm.Font=Enum.Font.GothamBold
+	spConfirm.TextSize=11
+	spConfirm.AutoButtonColor=true
+	spConfirm.ZIndex=1553
+	Instance.new("UICorner",spConfirm).CornerRadius=UDim.new(0,6)
+	SpawnPetState.ConfirmButton=spConfirm
+
 	local spHeightLabel=Instance.new("TextLabel",SpawnPetState.Panel)
 	spHeightLabel.Size=UDim2.fromOffset(70,20)
-	spHeightLabel.Position=UDim2.fromOffset(15,292)
+	spHeightLabel.Position=UDim2.fromOffset(15,416)
 	spHeightLabel.BackgroundTransparency=1
 	spHeightLabel.Text="Height"
 	spHeightLabel.TextColor3=Color3.fromRGB(210,210,215)
@@ -3962,7 +7687,7 @@ function SpawnPet_InitUI()
 
 	local spHeight=Instance.new("TextBox",SpawnPetState.Panel)
 	spHeight.Size=UDim2.fromOffset(80,25)
-	spHeight.Position=UDim2.fromOffset(70,290)
+	spHeight.Position=UDim2.fromOffset(70,414)
 	spHeight.BackgroundColor3=Color3.fromRGB(40,40,45)
 	spHeight.BorderSizePixel=0
 	spHeight.Text="0.5"
@@ -3976,7 +7701,7 @@ function SpawnPet_InitUI()
 
 	local spWeightLabel=Instance.new("TextLabel",SpawnPetState.Panel)
 	spWeightLabel.Size=UDim2.fromOffset(70,20)
-	spWeightLabel.Position=UDim2.fromOffset(160,292)
+	spWeightLabel.Position=UDim2.fromOffset(160,416)
 	spWeightLabel.BackgroundTransparency=1
 	spWeightLabel.Text="Weight/Scale"
 	spWeightLabel.TextColor3=Color3.fromRGB(210,210,215)
@@ -3987,7 +7712,7 @@ function SpawnPet_InitUI()
 
 	local spWeight=Instance.new("TextBox",SpawnPetState.Panel)
 	spWeight.Size=UDim2.fromOffset(55,25)
-	spWeight.Position=UDim2.fromOffset(233,290)
+	spWeight.Position=UDim2.fromOffset(233,414)
 	spWeight.BackgroundColor3=Color3.fromRGB(40,40,45)
 	spWeight.BorderSizePixel=0
 	spWeight.Text="1"
@@ -4008,7 +7733,7 @@ function SpawnPet_InitUI()
 	local spSpawn=Instance.new("TextButton",SpawnPetState.Panel)
 	spSpawn.Name="SpawnPetButton"
 	spSpawn.Size=UDim2.new(0.5,-4,0,40)
-	spSpawn.Position=UDim2.fromOffset(15,330)
+	spSpawn.Position=UDim2.fromOffset(15,454)
 	spSpawn.BackgroundColor3=Color3.fromRGB(118,255,10)
 	spSpawn.BorderSizePixel=0
 	spSpawn.Text="SPAWN PET"
@@ -4023,7 +7748,7 @@ function SpawnPet_InitUI()
 	local spClear=Instance.new("TextButton",SpawnPetState.Panel)
 	spClear.Name="ClearPetButton"
 	spClear.Size=UDim2.new(0.5,-4,0,40)
-	spClear.Position=UDim2.new(0.5,1,0,330)
+	spClear.Position=UDim2.new(0.5,1,0,454)
 	spClear.BackgroundColor3=Color3.fromRGB(150,40,200)
 	spClear.BorderSizePixel=0
 	spClear.Text="CLEAR PET"
@@ -4044,7 +7769,7 @@ function SpawnPet_InitUI()
 		local batchBtn = Instance.new("TextButton", SpawnPetState.Panel)
 		batchBtn.Name = "SpawnPetBatch" .. tostring(amount)
 		batchBtn.Size = UDim2.fromOffset(80, 34)
-		batchBtn.Position = UDim2.fromOffset(15 + (index - 1) * 90, 378)
+		batchBtn.Position = UDim2.fromOffset(15 + (index - 1) * 90, 502)
 		batchBtn.BackgroundColor3 = Color3.fromRGB(118, 255, 10)
 		batchBtn.BorderSizePixel = 0
 		batchBtn.Text = "x" .. tostring(amount)
@@ -4064,11 +7789,11 @@ function SpawnPet_InitUI()
 		end)
 	end
 
-	spSearch.FocusLost:Connect(function(enterPressed)
-		if enterPressed then SpawnPet_Search(spSearch.Text) end
-	end)
+	spConfirm.Activated:Connect(function() SpawnPet_ConfirmSearch() end)
 	spSpawn.Activated:Connect(function() SpawnPet_SpawnCurrent() end)
 	spClear.Activated:Connect(function() SpawnPet_ClearSpawnedPets() end)
+	SpawnPetState.ConfirmedMutations = {}
+	SpawnPet_SetSelectedMutation("None", true)
 end
 
 SpawnPet_InitUI()
@@ -8943,6 +12668,7 @@ SendPlayer_RefreshRows()
 ShowFakeGiftPrompt = function()
 	ActiveGiftSource = "Shop"
 	GiftPlayer_RefreshRows()
+	if PetSellPrompt then PetSellPrompt.Visible = false end
 	SendPlayerPrompt.Visible = false
 	if SendGiftComposePrompt then SendGiftComposePrompt.Visible = false end
 	SuccessPrompt.Visible =
@@ -10866,9 +14592,15 @@ function SendGiftCompose_GetPetImage(tool)
 	end
 
 	local petName = SendGiftCompose_GetPetName(tool)
+	local toolMutation = ""
+	pcall(function() toolMutation = tostring(tool:GetAttribute("PetBaseMutation") or "") end)
+	if SpawnPet_Normalize(toolMutation) == "" then
+		pcall(function() toolMutation = tostring(tool:GetAttribute("PetMutations") or "") end)
+	end
+	toolMutation = string.match(toolMutation, "^[^,]+") or toolMutation
 	if SpawnPet_GetReal2DIcon then
 		pcall(function()
-			image = tostring(SpawnPet_GetReal2DIcon(petName) or "")
+			image = tostring(SpawnPet_GetReal2DIcon(petName, toolMutation) or "")
 		end)
 	end
 	return image
@@ -10897,7 +14629,7 @@ function SendGiftCompose_CaptureSentPetVisuals(tools)
 	end
 end
 
-function SpawnPet_RefillReleasedHotbarSlots(releasedSlots, excludedTools)
+function SpawnPet_LegacyRefillReleasedHotbarSlots(releasedSlots, excludedTools)
 	if type(releasedSlots) ~= "table" or #releasedSlots == 0 then return end
 	SpawnPetState.ToolToSlot = SpawnPetState.ToolToSlot or {}
 	excludedTools = excludedTools or {}
@@ -10917,12 +14649,20 @@ function SpawnPet_RefillReleasedHotbarSlots(releasedSlots, excludedTools)
 			end
 			if not candidate then break end
 
+			local mutationText=tostring(candidate:GetAttribute("PetMutations") or "")
+			local baseMutation=tostring(candidate:GetAttribute("PetBaseMutation") or "")
 			local meta={
 				name=tostring(candidate:GetAttribute("PetName") or candidate.Name or "Spawned Pet"),
 				perSecond=tostring(candidate:GetAttribute("PetBPS") or ""),
 				image=tostring(candidate.TextureId or ""),
 				rarity=tostring(candidate:GetAttribute("PetRarity") or ""),
-				scale=tonumber(candidate:GetAttribute("PetScale") or 1) or 1
+				scale=tonumber(candidate:GetAttribute("PetScale") or 1) or 1,
+				category=tostring(candidate:GetAttribute("PetCategory") or candidate:GetAttribute("PetName") or candidate.Name or ""),
+				mutations=SpawnPet_ParseMutationList(mutationText),
+				baseMutation=(baseMutation ~= "" and baseMutation or nil),
+				earningRate=tonumber(candidate:GetAttribute("PetEarningRate") or 0) or 0,
+				perSecondValue=tonumber(candidate:GetAttribute("PetPerSecond") or 0) or 0,
+				rarityNumber=tonumber(candidate:GetAttribute("PetRarityNumber") or 0) or 0
 			}
 			if SpawnPet_BindHotbarSlot(slot,candidate,meta,meta.image) then
 				candidate:SetAttribute("VirtualPetInventoryOnly", false)
@@ -11415,6 +15155,262 @@ ShowSendPlayerPrompt = function()
 	DarkOverlay.BackgroundTransparency = 1
 end
 
+-- ==========================================
+-- PET SELL PANEL
+-- Independent window using the SAME visual/effect structure as Gift Player,
+-- but recolored to a green theme. The body remains completely empty.
+-- ==========================================
+PetSellPrompt = Instance.new("Frame", ScreenGui)
+PetSellPrompt.Name = "PetSellPrompt"
+PetSellPrompt.Size = UDim2.new(0, 820, 0, 610)
+PetSellPrompt.Position = UDim2.new(0.5, 0, 0.5, 0)
+PetSellPrompt.AnchorPoint = Vector2.new(0.5, 0.5)
+PetSellPrompt.BackgroundColor3 = Color3.fromRGB(18, 72, 30)
+PetSellPrompt.BorderSizePixel = 0
+PetSellPrompt.Visible = false
+PetSellPrompt.ClipsDescendants = true
+PetSellPrompt.ZIndex = 640
+
+PetSell_OuterStroke = Instance.new("UIStroke", PetSellPrompt)
+PetSell_OuterStroke.Name = "PetSellOuterStroke"
+PetSell_OuterStroke.Color = Color3.fromRGB(0, 0, 0)
+PetSell_OuterStroke.Thickness = 2
+
+-- Same base/background layering as Gift Player, recolored green.
+PetSell_TiledBackground = Instance.new("ImageLabel", PetSellPrompt)
+PetSell_TiledBackground.Name = "PetSellTiledBackground"
+PetSell_TiledBackground.Size = UDim2.fromScale(1, 1)
+PetSell_TiledBackground.Position = UDim2.fromScale(0, 0)
+PetSell_TiledBackground.BackgroundTransparency = 0
+PetSell_TiledBackground.BackgroundColor3 = Color3.fromRGB(24, 92, 38)
+PetSell_TiledBackground.BorderSizePixel = 0
+PetSell_TiledBackground.Image = ""
+PetSell_TiledBackground.ImageTransparency = 1
+PetSell_TiledBackground.ZIndex = 640
+PetSell_TiledBackground.Active = false
+
+PetSell_FullBackgroundEffect = Instance.new("ImageLabel", PetSellPrompt)
+PetSell_FullBackgroundEffect.Name = "PetSellFullBackgroundEffect"
+PetSell_FullBackgroundEffect.Size = UDim2.fromScale(1, 1)
+PetSell_FullBackgroundEffect.Position = UDim2.fromScale(0, 0)
+PetSell_FullBackgroundEffect.BackgroundTransparency = 1
+PetSell_FullBackgroundEffect.BorderSizePixel = 0
+PetSell_FullBackgroundEffect.Image = "rbxassetid://131176354845909"
+PetSell_FullBackgroundEffect.ImageColor3 = Color3.fromRGB(38, 210, 82)
+PetSell_FullBackgroundEffect.ImageTransparency = 0.45
+PetSell_FullBackgroundEffect.ScaleType = Enum.ScaleType.Tile
+PetSell_FullBackgroundEffect.TileSize = UDim2.fromOffset(60, 60)
+PetSell_FullBackgroundEffect.ZIndex = 641
+PetSell_FullBackgroundEffect.Active = false
+PetSell_FullBackgroundEffect.Visible = true
+
+PetSell_CenterEffect = Instance.new("ImageLabel", PetSellPrompt)
+PetSell_CenterEffect.Name = "PetSellCenterEffect"
+PetSell_CenterEffect.Size = UDim2.new(1, -24, 1, -115)
+PetSell_CenterEffect.Position = UDim2.fromOffset(12, 100)
+PetSell_CenterEffect.BackgroundTransparency = 1
+PetSell_CenterEffect.BorderSizePixel = 0
+PetSell_CenterEffect.Image = "rbxassetid://126841495627073"
+PetSell_CenterEffect.ImageColor3 = Color3.fromRGB(78, 225, 105)
+PetSell_CenterEffect.ImageTransparency = 0.48
+PetSell_CenterEffect.ScaleType = Enum.ScaleType.Stretch
+PetSell_CenterEffect.ZIndex = 642
+PetSell_CenterEffect.Active = false
+PetSell_CenterEffect.Visible = true
+
+-- ==========================================
+-- PET SELL HEADER
+-- ==========================================
+-- Exact same header layering/animation texture family as Gift Player,
+-- with the purple palette changed to neon green.
+PetSell_HeaderBorder = Instance.new("Frame", PetSellPrompt)
+PetSell_HeaderBorder.Name = "PetSellHeaderBorder"
+PetSell_HeaderBorder.Size = UDim2.new(1, 0, 0, 90)
+PetSell_HeaderBorder.Position = UDim2.fromOffset(0, 0)
+PetSell_HeaderBorder.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+PetSell_HeaderBorder.BorderSizePixel = 0
+PetSell_HeaderBorder.ZIndex = 645
+
+PetSell_HeaderBorderGradient = Instance.new("UIGradient", PetSell_HeaderBorder)
+PetSell_HeaderBorderGradient.Name = "PetSellHeaderBorderGradient"
+PetSell_HeaderBorderGradient.Color = ColorSequence.new({
+    ColorSequenceKeypoint.new(0.00, Color3.fromRGB(228, 255, 232)),
+    ColorSequenceKeypoint.new(0.10, Color3.fromRGB(248, 255, 248)),
+    ColorSequenceKeypoint.new(0.22, Color3.fromRGB(196, 255, 207)),
+    ColorSequenceKeypoint.new(0.38, Color3.fromRGB(40, 255, 93)),
+    ColorSequenceKeypoint.new(0.56, Color3.fromRGB(211, 255, 220)),
+    ColorSequenceKeypoint.new(0.72, Color3.fromRGB(134, 255, 158)),
+    ColorSequenceKeypoint.new(0.86, Color3.fromRGB(72, 242, 105)),
+    ColorSequenceKeypoint.new(1.00, Color3.fromRGB(22, 194, 66))
+})
+
+PetSell_HeaderFrame = Instance.new("Frame", PetSellPrompt)
+PetSell_HeaderFrame.Name = "PetSellHeader"
+PetSell_HeaderFrame.Size = UDim2.new(1, -4, 0, 86)
+PetSell_HeaderFrame.Position = UDim2.fromOffset(2, 2)
+PetSell_HeaderFrame.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+PetSell_HeaderFrame.BorderSizePixel = 0
+PetSell_HeaderFrame.ZIndex = 800
+
+-- Same supplied diagonal effect used by Gift Player.
+PetSell_HeaderGlow = Instance.new("ImageLabel", PetSell_HeaderFrame)
+PetSell_HeaderGlow.Name = "Stroke_98981360538955"
+PetSell_HeaderGlow.Size = UDim2.new(0, 542, 1, 0)
+PetSell_HeaderGlow.Position = UDim2.new(0, 271, 0, 0)
+PetSell_HeaderGlow.AnchorPoint = Vector2.new(0, 0)
+PetSell_HeaderGlow.BackgroundTransparency = 1
+PetSell_HeaderGlow.BorderSizePixel = 0
+PetSell_HeaderGlow.Image = "rbxassetid://98981360538955"
+PetSell_HeaderGlow.ImageColor3 = Color3.fromRGB(255, 255, 255)
+PetSell_HeaderGlow.ImageTransparency = 0
+PetSell_HeaderGlow.ScaleType = Enum.ScaleType.Stretch
+PetSell_HeaderGlow.ResampleMode = Enum.ResamplerMode.Default
+PetSell_HeaderGlow.ZIndex = 900
+PetSell_HeaderGlow.Visible = true
+PetSell_HeaderGlow.Active = false
+
+-- Same full-header supplied effect used by Gift Player, recolored green.
+PetSell_HeaderCenterEffect = Instance.new("ImageLabel", PetSell_HeaderFrame)
+PetSell_HeaderCenterEffect.Name = "PetSellHeaderCenterEffect"
+PetSell_HeaderCenterEffect.Size = UDim2.fromScale(1, 1)
+PetSell_HeaderCenterEffect.Position = UDim2.fromScale(0, 0)
+PetSell_HeaderCenterEffect.BackgroundTransparency = 1
+PetSell_HeaderCenterEffect.BorderSizePixel = 0
+PetSell_HeaderCenterEffect.Image = "rbxassetid://126841495627073"
+PetSell_HeaderCenterEffect.ImageColor3 = Color3.fromRGB(64, 220, 92)
+PetSell_HeaderCenterEffect.ImageTransparency = 0.48
+PetSell_HeaderCenterEffect.ScaleType = Enum.ScaleType.Stretch
+PetSell_HeaderCenterEffect.ZIndex = 805
+PetSell_HeaderCenterEffect.Active = false
+PetSell_HeaderCenterEffect.Visible = true
+
+PetSell_HeaderGradient = Instance.new("UIGradient", PetSell_HeaderFrame)
+PetSell_HeaderGradient.Name = "PetSellHeaderGradient"
+PetSell_HeaderGradient.Color = ColorSequence.new({
+    ColorSequenceKeypoint.new(0.00, Color3.fromRGB(31, 255, 84)),
+    ColorSequenceKeypoint.new(0.16, Color3.fromRGB(20, 177, 55)),
+    ColorSequenceKeypoint.new(0.34, Color3.fromRGB(42, 225, 74)),
+    ColorSequenceKeypoint.new(0.50, Color3.fromRGB(173, 255, 188)),
+    ColorSequenceKeypoint.new(0.63, Color3.fromRGB(111, 250, 132)),
+    ColorSequenceKeypoint.new(0.75, Color3.fromRGB(39, 217, 70)),
+    ColorSequenceKeypoint.new(0.90, Color3.fromRGB(24, 188, 55)),
+    ColorSequenceKeypoint.new(1.00, Color3.fromRGB(8, 129, 38))
+})
+
+-- Same square-pattern texture used by Gift Player.
+PetSell_HeaderPattern = Instance.new("ImageLabel", PetSell_HeaderFrame)
+PetSell_HeaderPattern.Name = "PatternTexture"
+PetSell_HeaderPattern.Size = UDim2.new(1, 0, 1, -4)
+PetSell_HeaderPattern.Position = UDim2.fromOffset(0, 0)
+PetSell_HeaderPattern.BackgroundTransparency = 1
+PetSell_HeaderPattern.BorderSizePixel = 0
+PetSell_HeaderPattern.Image = "rbxassetid://90325592797235"
+PetSell_HeaderPattern.ScaleType = Enum.ScaleType.Tile
+PetSell_HeaderPattern.TileSize = UDim2.fromOffset(60, 60)
+PetSell_HeaderPattern.ImageTransparency = 0.72
+PetSell_HeaderPattern.ImageColor3 = Color3.fromRGB(255, 255, 255)
+PetSell_HeaderPattern.Active = false
+PetSell_HeaderPattern.ZIndex = 850
+
+pcall(function()
+    ContentProvider:PreloadAsync({PetSell_HeaderGlow, PetSell_HeaderCenterEffect, PetSell_HeaderPattern})
+end)
+
+-- Same title proportions/stroke as Gift Player, without the gift icon.
+PetSell_Title = Instance.new("TextLabel", PetSell_HeaderFrame)
+PetSell_Title.Name = "PetSellTitle"
+PetSell_Title.Size = UDim2.new(0, 560, 1, 0)
+PetSell_Title.Position = UDim2.fromOffset(28, 0)
+PetSell_Title.BackgroundTransparency = 1
+PetSell_Title.Text = "PET SELL"
+PetSell_Title.TextColor3 = Color3.fromRGB(255, 255, 255)
+PetSell_Title.Font = Enum.Font.FredokaOne
+PetSell_Title.TextSize = 54
+PetSell_Title.TextXAlignment = Enum.TextXAlignment.Left
+PetSell_Title.TextYAlignment = Enum.TextYAlignment.Center
+PetSell_Title.TextScaled = false
+PetSell_Title.TextWrapped = false
+PetSell_Title.ZIndex = 920
+
+PetSell_TitleStroke = Instance.new("UIStroke", PetSell_Title)
+PetSell_TitleStroke.Color = Color3.fromRGB(0, 0, 0)
+PetSell_TitleStroke.Thickness = 4.5
+
+-- Same close-button dimensions/appearance as Gift Player.
+PetSell_CloseBtn = Instance.new("ImageButton", PetSell_HeaderFrame)
+PetSell_CloseBtn.Name = "PetSellClose"
+PetSell_CloseBtn.Size = UDim2.fromOffset(56, 56)
+PetSell_CloseBtn.Position = UDim2.new(1, -10, 0.5, 0)
+PetSell_CloseBtn.AnchorPoint = Vector2.new(1, 0.5)
+PetSell_CloseBtn.BackgroundColor3 = Color3.fromRGB(255, 0, 0)
+PetSell_CloseBtn.BorderSizePixel = 0
+PetSell_CloseBtn.Image = ""
+PetSell_CloseBtn.AutoButtonColor = false
+PetSell_CloseBtn.ZIndex = 979
+
+PetSell_CloseBtnStroke = Instance.new("UIStroke", PetSell_CloseBtn)
+PetSell_CloseBtnStroke.Color = Color3.fromRGB(0, 0, 0)
+PetSell_CloseBtnStroke.Thickness = 3
+
+PetSell_CloseX = Instance.new("TextLabel", PetSell_CloseBtn)
+PetSell_CloseX.Name = "CloseX"
+PetSell_CloseX.Size = UDim2.new(1, 0, 1, -4)
+PetSell_CloseX.Position = UDim2.fromOffset(0, 0)
+PetSell_CloseX.BackgroundTransparency = 1
+PetSell_CloseX.Text = "X"
+PetSell_CloseX.TextColor3 = Color3.fromRGB(255, 255, 255)
+PetSell_CloseX.Font = Enum.Font.FredokaOne
+PetSell_CloseX.TextSize = 36
+PetSell_CloseX.TextXAlignment = Enum.TextXAlignment.Center
+PetSell_CloseX.TextYAlignment = Enum.TextYAlignment.Center
+PetSell_CloseX.ZIndex = 982
+PetSell_CloseX.Active = false
+
+PetSell_CloseXStroke = Instance.new("UIStroke", PetSell_CloseX)
+PetSell_CloseXStroke.Color = Color3.fromRGB(0, 0, 0)
+PetSell_CloseXStroke.Thickness = 4
+
+-- Empty body/list container. No players are copied into Pet Sell.
+PetSell_List = Instance.new("ScrollingFrame", PetSellPrompt)
+PetSell_List.Name = "PetSellList"
+PetSell_List.Size = UDim2.new(1, -24, 1, -115)
+PetSell_List.Position = UDim2.fromOffset(12, 100)
+PetSell_List.BackgroundTransparency = 1
+PetSell_List.BorderSizePixel = 0
+PetSell_List.ZIndex = 644
+PetSell_List.ScrollBarThickness = 8
+PetSell_List.ScrollBarImageColor3 = Color3.fromRGB(102, 255, 126)
+PetSell_List.CanvasSize = UDim2.new(0, 0, 0, 0)
+PetSell_List.AutomaticCanvasSize = Enum.AutomaticSize.Y
+PetSell_List.Active = true
+PetSell_List.ClipsDescendants = true
+
+PetSell_ListLayout = Instance.new("UIListLayout", PetSell_List)
+PetSell_ListLayout.SortOrder = Enum.SortOrder.LayoutOrder
+PetSell_ListLayout.Padding = UDim.new(0, 8)
+
+local function ShowPetSellPrompt()
+    GiftPrompt.Visible = false
+    if SendPlayerPrompt then SendPlayerPrompt.Visible = false end
+    if SendGiftComposePrompt then SendGiftComposePrompt.Visible = false end
+    if SpawnModelPanel then SpawnModelPanel.Visible = false end
+    if SpawnPetState and SpawnPetState.Panel then SpawnPetState.Panel.Visible = false end
+    PetSellPrompt.Visible = true
+    DarkOverlay.Visible = false
+    DarkOverlay.BackgroundTransparency = 1
+end
+
+local function ClosePetSellPrompt()
+    PetSellPrompt.Visible = false
+end
+
+PetSell_CloseBtn.MouseButton1Click:Connect(ClosePetSellPrompt)
+PetSell_CloseBtn.Activated:Connect(ClosePetSellPrompt)
+
+SellPetBtn.MouseButton1Click:Connect(ShowPetSellPrompt)
+SellPetBtn.Activated:Connect(ShowPetSellPrompt)
+
+-- ==========================================
 -- CLOSE ALL
 -- ==========================================
 local function ClosePopups(preserveConfetti)
@@ -11436,6 +15432,9 @@ local function ClosePopups(preserveConfetti)
 	end
 	if SendGiftComposePrompt then
 		SendGiftComposePrompt.Visible = false
+	end
+	if PetSellPrompt then
+		PetSellPrompt.Visible = false
 	end
 
 	BuyPrompt.Visible =
@@ -12268,3 +16267,1444 @@ end
 PlayerGui.DescendantAdded:Connect(
 	HookGiftButton
 )
+
+
+-- v38.0: definitive Hotbar mutation compositor heartbeat.
+-- Re-renders the top-level replica only for tracked spawned pets; the real
+-- Icon is never used as the mutation layer and therefore survives any
+-- BackpackController repaint. Absolute coordinates keep the replica locked
+-- to the actual Icon even when its parent/layout changes.
+SpawnPetState.HotbarSiblingMutationHeartbeat = SpawnPetState.HotbarSiblingMutationHeartbeat or nil
+if SpawnPetState.HotbarSiblingMutationHeartbeat then
+	pcall(function() SpawnPetState.HotbarSiblingMutationHeartbeat:Disconnect() end)
+end
+local __SpawnPetLastSiblingSweep = 0
+SpawnPetState.HotbarSiblingMutationHeartbeat = RunService.RenderStepped:Connect(function()
+	local now = os.clock()
+	if now - __SpawnPetLastSiblingSweep < 0.05 then return end
+	__SpawnPetLastSiblingSweep = now
+
+	for slot, state in pairs(SpawnPetState.HotbarMutationWatchdogs or {}) do
+		if slot and slot.Parent and state and state.tool and state.tool.Parent then
+			pcall(function() SpawnPet_HotbarRenderExactMutation(slot, state.meta) end)
+		else
+			if slot then pcall(function() SpawnPet_HotbarDestroyTopLevelReplica(slot, false) end) end
+		end
+	end
+end)
+
+
+
+-- ============================================================================
+-- v48 HOTBAR: RAINBOW LAYER ONLY FROM CONTROL PANEL
+-- ============================================================================
+-- The Hotbar must display ONLY the Rainbow layer that is actually present in
+-- the Control Panel preview. The base pet icon is intentionally hidden.
+--
+-- Source flow:
+--   Control Panel Icon
+--      -> RainbowOverlayImage
+--         -> RarityGradient
+--      -> clone ONLY RainbowOverlayImage tree
+--      -> place as a top-level sibling over the Hotbar slot
+--
+-- Nothing is rebuilt from the pet's base Icon.Image and there is no fallback
+-- from the Rainbow layer to the ordinary pet icon image.
+-- ============================================================================
+
+local V48_VERSION = "48-rainbow-only-control-panel"
+local V48_ROOT_NAME = "__SpawnPetV49RainbowOnlyRoot"
+local V48_LAYER_PREFIX = "__SpawnPetV49RainbowOnly_"
+
+SpawnPetState.V48RainbowOnlyBySlot = SpawnPetState.V48RainbowOnlyBySlot or setmetatable({}, {__mode="k"})
+SpawnPetState.V48Watchdogs = SpawnPetState.V48Watchdogs or setmetatable({}, {__mode="k"})
+SpawnPetState.ControlPanelVisualByTool = SpawnPetState.ControlPanelVisualByTool or setmetatable({}, {__mode="k"})
+SpawnPetState.ControlPanelVisualBySlot = SpawnPetState.ControlPanelVisualBySlot or setmetatable({}, {__mode="k"})
+SpawnPetState.MetaByTool = SpawnPetState.MetaByTool or setmetatable({}, {__mode="k"})
+
+local function V48_DisconnectMap(map)
+    for _, state in pairs(map or {}) do
+        if type(state) == "table" and type(state.connections) == "table" then
+            for _, connection in ipairs(state.connections) do
+                pcall(function() connection:Disconnect() end)
+            end
+        elseif typeof(state) == "RBXScriptConnection" then
+            pcall(function() state:Disconnect() end)
+        end
+    end
+end
+
+-- Stop previous mutation visual/watchdog families so v48 is the only writer.
+V48_DisconnectMap(SpawnPetState.V47Watchdogs)
+SpawnPetState.V47Watchdogs = {}
+V48_DisconnectMap(SpawnPetState.V46Watchdogs)
+SpawnPetState.V46Watchdogs = {}
+V48_DisconnectMap(SpawnPetState.V45Watchdogs)
+SpawnPetState.V45Watchdogs = {}
+V48_DisconnectMap(SpawnPetState.V44Watchdogs)
+SpawnPetState.V44Watchdogs = {}
+V48_DisconnectMap(SpawnPetState.V43Watchdogs)
+SpawnPetState.V43Watchdogs = {}
+V48_DisconnectMap(SpawnPetState.HotbarMutationWatchdogs)
+SpawnPetState.HotbarMutationWatchdogs = {}
+V48_DisconnectMap(SpawnPetState.RainbowHotbarRepair)
+SpawnPetState.RainbowHotbarRepair = {}
+if SpawnPetState.HotbarSiblingMutationHeartbeat then
+    pcall(function() SpawnPetState.HotbarSiblingMutationHeartbeat:Disconnect() end)
+    SpawnPetState.HotbarSiblingMutationHeartbeat = nil
+end
+
+-- Remove previous generated roots, including v47's full-tree replica root.
+pcall(function()
+    if ScreenGui and ScreenGui.Parent then
+        for _, child in ipairs(ScreenGui:GetChildren()) do
+            local n = tostring(child.Name or "")
+            if n == V48_ROOT_NAME
+                or n == "__SpawnPetV48RainbowOnlyRoot"
+                or n == "__SpawnPetV47ControlPanelIconRoot"
+                or n == "__SpawnPetV46HotbarRainbowRoot"
+                or n == "__SpawnPetV45HotbarRainbowRoot"
+                or n == "__SpawnPetV44HotbarRainbowRoot"
+                or n == "__SpawnPetV43HotbarRainbowRoot" then
+                pcall(function() child:Destroy() end)
+            end
+        end
+    end
+end)
+
+local function V48_IsRainbow(meta)
+    if not meta then return false end
+    if SpawnPet_HasMutationName(meta, "Rainbow") then return true end
+    for _, mutation in ipairs(SpawnPet_V33MutationList(meta) or {}) do
+        if SpawnPet_V33Token(mutation) == "rainbow" then return true end
+    end
+    return SpawnPet_V33Token(meta.baseMutation) == "rainbow"
+end
+
+local function V48_MutationSignature(meta)
+    local keys = {}
+    for _, mutation in ipairs(SpawnPet_V33MutationList(meta or {})) do
+        keys[#keys + 1] = SpawnPet_V33Token(mutation)
+    end
+    table.sort(keys)
+    return table.concat(keys, "+")
+end
+
+local function V48_FindRainbowNode(root)
+    if not root then return nil end
+    if SpawnPet_V33Token(root.Name or "") == "rainbowoverlayimage" then
+        return root
+    end
+    for _, node in ipairs(root:GetDescendants()) do
+        if SpawnPet_V33Token(node.Name or "") == "rainbowoverlayimage" then
+            return node
+        end
+    end
+    return nil
+end
+
+local function V48_GetRainbowGradient(node)
+    if not node then return nil end
+    local gradient = node:FindFirstChild("RarityGradient", true)
+    if gradient and gradient:IsA("UIGradient") then return gradient end
+    return nil
+end
+
+-- v49: Resolve the ACTUAL visible Hotbar Icon instead of trusting
+-- slot:FindFirstChild("Icon", true), because some game slots contain more than
+-- one Icon descendant (template/hidden/icon-wrapper variants). The wrong match
+-- makes the Rainbow layer align to an invisible object while the normal pet icon
+-- remains visible, exactly like the reported screenshot.
+local function V49_IsGuiBranchVisible(gui)
+    if not gui then return false end
+    local node = gui
+    while node and node ~= ScreenGui do
+        if node:IsA("GuiObject") and node.Visible == false then
+            return false
+        end
+        node = node.Parent
+    end
+    return true
+end
+
+local function V49_NormalizeImage(value)
+    local ok, normalized = pcall(function()
+        return SpawnPet_HotbarNormalizeImage(value or "")
+    end)
+    if ok then return tostring(normalized or "") end
+    return tostring(value or "")
+end
+
+function SpawnPet_FindActualHotbarIcon(slot, tool)
+    if not slot then return nil end
+
+    local original = SpawnPetState.HotbarOriginals and SpawnPetState.HotbarOriginals[slot]
+    local wantedTexture = ""
+    if tool then
+        pcall(function() wantedTexture = V49_NormalizeImage(tool.TextureId or "") end)
+    end
+    local wantedOriginal = original and V49_NormalizeImage(original.icon or "") or ""
+
+    local candidates = {}
+    for _, node in ipairs(slot:GetDescendants()) do
+        if (node:IsA("ImageLabel") or node:IsA("ImageButton")) then
+            local isNamedIcon = string.lower(tostring(node.Name or "")) == "icon"
+            local image = V49_NormalizeImage(node.Image or "")
+            local size = node.AbsoluteSize
+            local area = math.max(0, size.X) * math.max(0, size.Y)
+            if area >= 4 then
+                local visible = V49_IsGuiBranchVisible(node)
+                local score = 0
+                if isNamedIcon then score += 1000000000 end
+                if visible then score += 500000000 end
+                if image ~= "" then score += 10000000 end
+                if wantedTexture ~= "" and image == wantedTexture then score += 5000000000 end
+                if wantedOriginal ~= "" and image == wantedOriginal then score += 2000000000 end
+                if node.ImageTransparency < 1 then score += 1000000 end
+                score += math.min(area, 999999)
+                candidates[#candidates + 1] = {
+                    node=node,
+                    score=score,
+                    visible=visible,
+                    named=isNamedIcon,
+                    area=area,
+                }
+            end
+        end
+    end
+
+    table.sort(candidates, function(a, b)
+        if a.score ~= b.score then return a.score > b.score end
+        return a.area > b.area
+    end)
+
+    for _, candidate in ipairs(candidates) do
+        if candidate.named and candidate.visible then
+            return candidate.node
+        end
+    end
+    for _, candidate in ipairs(candidates) do
+        if candidate.visible then
+            return candidate.node
+        end
+    end
+    return candidates[1] and candidates[1].node or nil
+end
+
+local function V48_GetPreviewIcon()
+    local icon = SpawnPetState.Icon
+    if icon and (icon:IsA("ImageLabel") or icon:IsA("ImageButton")) and icon.Parent then
+        return icon
+    end
+    return nil
+end
+
+local function V48_GetRoot()
+    if SpawnPetState.V48Root and SpawnPetState.V48Root.Parent then
+        return SpawnPetState.V48Root
+    end
+    if not ScreenGui or not ScreenGui.Parent then return nil end
+
+    local root = Instance.new("Frame")
+    root.Name = V48_ROOT_NAME
+    root.BackgroundTransparency = 1
+    root.BorderSizePixel = 0
+    root.Position = UDim2.fromScale(0, 0)
+    root.Size = UDim2.fromScale(1, 1)
+    root.AnchorPoint = Vector2.new(0, 0)
+    root.ClipsDescendants = false
+    root.Active = false
+    root.Selectable = false
+    root.ZIndex = 260000
+    root.Parent = ScreenGui
+    SpawnPetState.V48Root = root
+    return root
+end
+
+local function V48_DestroyRainbowLayer(slot)
+    local layer = SpawnPetState.V48RainbowOnlyBySlot and SpawnPetState.V48RainbowOnlyBySlot[slot]
+    if layer then
+        pcall(function() layer:Destroy() end)
+    end
+    if SpawnPetState.V48RainbowOnlyBySlot then
+        SpawnPetState.V48RainbowOnlyBySlot[slot] = nil
+    end
+
+    local root = SpawnPetState.V48Root
+    if root and root.Parent then
+        local named = root:FindFirstChild(V48_LAYER_PREFIX .. tostring(slot), true)
+        if named then pcall(function() named:Destroy() end) end
+    end
+
+    local icon = SpawnPet_FindActualHotbarIcon(slot)
+    if icon and (icon:IsA("ImageLabel") or icon:IsA("ImageButton")) then
+        local original = SpawnPetState.HotbarOriginals and SpawnPetState.HotbarOriginals[slot]
+        pcall(function()
+            icon.Visible = original and original.visible ~= false or true
+            icon.ImageTransparency = original and tonumber(original.imageTransparency) or 0
+        end)
+    end
+end
+
+local function V48_ClearLegacyVisuals(slot)
+    if not slot then return end
+    local names = {
+        "__SpawnPetHotbarRainbowSibling",
+        "__SpawnPetHotbarExtraMutationOverlay",
+        "__SpawnPetHotbarControlPanelReplica",
+        "__SpawnPetMutationBaseOverlay",
+        "__SpawnPetRainbowOverlay",
+        "__SpawnPetMutationVisual_rainbow",
+        "__SpawnPetMutationVisual_golden",
+        "__SpawnPetMutationVisual_silver",
+        "__SpawnPetMutationVisual_void",
+        "__SpawnPetMutationVisual_boss",
+        "__SpawnPetMutationVisual_greatbloom",
+        "__SpawnPetMutationVisual_monstrous",
+        "__SpawnPetMutationVisual_sakura",
+        "__SpawnPetMutationVisual_scrambled",
+        "__SpawnPetV44RainbowMutationLayer",
+        "__SpawnPetV45RainbowMutationLayer",
+        "__SpawnPetV46RainbowControlPanelLayer",
+        "__SpawnPetV48RainbowOnly",
+    }
+    for _, name in ipairs(names) do
+        local found = slot:FindFirstChild(name, true)
+        if found then pcall(function() found:Destroy() end) end
+    end
+
+    local root = ScreenGui and ScreenGui.Parent and ScreenGui:FindFirstChild("__SpawnPetV47ControlPanelIconRoot")
+    if root then
+        local name = V48_LAYER_PREFIX .. tostring(slot)
+        local old = root:FindFirstChild(name, true)
+        if old then pcall(function() old:Destroy() end) end
+    end
+end
+
+local function V48_EnsureControlPanelRainbow(meta)
+    local icon = V48_GetPreviewIcon()
+    if not icon then return false, "control-panel-icon-missing" end
+
+    local ok, resultA, resultB = pcall(function()
+        return SpawnPet_ApplySourceFaithfulMutationIcon(icon, meta or {})
+    end)
+    if not ok then
+        return false, "control-panel-source-render-error"
+    end
+    if resultA == false then
+        return false, tostring(resultB or "control-panel-source-render-failed")
+    end
+
+    local rainbow = V48_FindRainbowNode(icon)
+    local gradient = V48_GetRainbowGradient(rainbow)
+    local image = rainbow and tostring(rainbow.Image or "") or ""
+    if not (rainbow and gradient and image ~= "") then
+        return false, "control-panel-rainbow-layer-missing"
+    end
+
+    pcall(function() rainbow.Visible = true end)
+    pcall(function() gradient.Enabled = true end)
+    return true, "control-panel-rainbow-ready"
+end
+
+function SpawnPet_CaptureControlPanelVisualForTool(tool, meta)
+    if not tool then return nil end
+    local sourceIcon = V48_GetPreviewIcon()
+    if not sourceIcon then return nil end
+    meta = meta or SpawnPetState.Meta or {}
+
+    local ok, reason = V48_EnsureControlPanelRainbow(meta)
+    if not ok then
+        pcall(function() tool:SetAttribute("__SpawnPetV49CaptureError", tostring(reason or "control-panel-rainbow-unavailable")) end)
+        return nil
+    end
+
+    local sourceRainbow = V48_FindRainbowNode(sourceIcon)
+    local sourceGradient = V48_GetRainbowGradient(sourceRainbow)
+    if not sourceRainbow or not sourceGradient then
+        pcall(function() tool:SetAttribute("__SpawnPetV49CaptureError", "Rainbow-layer-not-in-ControlPanel") end)
+        return nil
+    end
+
+    local oldArchivable = sourceRainbow.Archivable
+    pcall(function() sourceRainbow.Archivable = true end)
+    local rainbowTemplate
+    local okClone = pcall(function() rainbowTemplate = sourceRainbow:Clone() end)
+    pcall(function() sourceRainbow.Archivable = oldArchivable end)
+    if not okClone or not rainbowTemplate then
+        pcall(function() tool:SetAttribute("__SpawnPetV49CaptureError", "Rainbow-layer-clone-failed") end)
+        return nil
+    end
+    pcall(function() rainbowTemplate.Parent = nil end)
+
+    local signature = V48_MutationSignature(meta)
+    local snapshot = {
+        rainbowTemplate = rainbowTemplate,
+        mutationSignature = signature,
+        sourceRainbowImage = tostring(sourceRainbow.Image or ""),
+        sourceIconSize = sourceIcon.AbsoluteSize,
+        sourceIconPosition = sourceIcon.AbsolutePosition,
+        rainbowReady = true,
+    }
+
+    SpawnPetState.ControlPanelVisualByTool[tool] = snapshot
+    pcall(function()
+        tool:SetAttribute("__SpawnPetV49Capture", "RAINBOW-ONLY-ControlPanel-RainbowOverlayImage")
+        tool:SetAttribute("__SpawnPetV49MutationSignature", signature)
+        tool:SetAttribute("__SpawnPetV49RainbowImage", snapshot.sourceRainbowImage)
+    end)
+    return snapshot
+end
+
+local function V48_FindToolForSlot(slot)
+    for candidate, boundSlot in pairs(SpawnPetState.ToolToSlot or {}) do
+        if boundSlot == slot then return candidate end
+    end
+    return nil
+end
+
+local function V48_GetSnapshotForSlot(slot, meta)
+    local expected = V48_MutationSignature(meta or {})
+    local tool = V48_FindToolForSlot(slot)
+    local snapshot = tool and SpawnPetState.ControlPanelVisualByTool[tool] or nil
+    if not snapshot then
+        snapshot = SpawnPetState.ControlPanelVisualBySlot[slot]
+    end
+    if snapshot and snapshot.rainbowTemplate and snapshot.mutationSignature == expected then
+        return snapshot, tool
+    end
+    if tool then
+        snapshot = SpawnPet_CaptureControlPanelVisualForTool(tool, meta)
+        if snapshot then
+            SpawnPetState.ControlPanelVisualBySlot[slot] = snapshot
+            return snapshot, tool
+        end
+    end
+    return nil, tool
+end
+
+local function V48_SetLayerZIndex(root, startZ)
+    local offset = 0
+    local function walk(node)
+        if not node then return end
+        if node:IsA("GuiObject") then
+            pcall(function() node.ZIndex = startZ + offset end)
+            offset += 1
+        end
+        for _, child in ipairs(node:GetChildren()) do
+            walk(child)
+        end
+    end
+    walk(root)
+end
+
+local function V48_ConfigureRainbowLayer(icon, layer, snapshot, slot)
+    if not icon or not layer or not snapshot then return false end
+    if not (layer:IsA("ImageLabel") or layer:IsA("ImageButton")) then return false end
+    if not layer.Parent then return false end
+
+    local image = tostring(layer.Image or "")
+    if image == "" then return false end
+    local gradient = V48_GetRainbowGradient(layer)
+    if not gradient then return false end
+
+    -- Preserve the captured Control Panel Rainbow image + gradient tree.
+    -- Only the outer screen-space geometry is changed so the layer sits exactly
+    -- over the actual Hotbar Icon rectangle.
+    local centerX = icon.AbsolutePosition.X + (icon.AbsoluteSize.X * 0.5)
+    local centerY = icon.AbsolutePosition.Y + (icon.AbsoluteSize.Y * 0.5)
+
+    pcall(function()
+        layer.Name = V48_LAYER_PREFIX .. tostring(slot)
+        layer.BackgroundTransparency = 1
+        layer.BorderSizePixel = 0
+        layer.AnchorPoint = Vector2.new(0.5, 0.5)
+        layer.Position = UDim2.fromOffset(centerX, centerY)
+        layer.Size = UDim2.fromOffset(
+            math.max(1, icon.AbsoluteSize.X),
+            math.max(1, icon.AbsoluteSize.Y)
+        )
+        layer.Rotation = icon.AbsoluteRotation
+        layer.Visible = icon.Visible ~= false
+        layer.Active = false
+        layer.Selectable = false
+        layer.ClipsDescendants = false
+        layer.ZIndex = 260200
+    end)
+
+    pcall(function() gradient.Enabled = true end)
+    V48_SetLayerZIndex(layer, 260200)
+
+    pcall(function()
+        layer:SetAttribute("__SpawnPetV49Source", "ControlPanel-RainbowOverlayImage")
+        layer:SetAttribute("__SpawnPetV49RainbowImage", image)
+        layer:SetAttribute("__SpawnPetV49MutationSignature", tostring(snapshot.mutationSignature or ""))
+    end)
+    return true
+end
+
+local function V48_RenderRainbowOnly(slot, icon, meta, snapshot)
+    if not V48_IsRainbow(meta) then
+        V48_DestroyRainbowLayer(slot)
+        return true, "no-rainbow"
+    end
+
+    if not snapshot or not snapshot.rainbowTemplate or not snapshot.rainbowReady then
+        V48_DestroyRainbowLayer(slot)
+        return false, "control-panel-rainbow-snapshot-missing"
+    end
+
+    local sourceTemplate = snapshot.rainbowTemplate
+    if not (V48_FindRainbowNode(sourceTemplate) and V48_GetRainbowGradient(sourceTemplate)) then
+        V48_DestroyRainbowLayer(slot)
+        return false, "control-panel-rainbow-template-invalid"
+    end
+
+    local root = V48_GetRoot()
+    if not root then
+        return false, "rainbow-only-root-unavailable"
+    end
+    root.Visible = true
+    root.ClipsDescendants = false
+
+    local layer = SpawnPetState.V48RainbowOnlyBySlot[slot]
+    local expectedSig = tostring(snapshot.mutationSignature or "")
+    local valid = layer
+        and layer.Parent == root
+        and (layer:IsA("ImageLabel") or layer:IsA("ImageButton"))
+        and tostring(layer:GetAttribute("__SpawnPetV49MutationSignature") or "") == expectedSig
+        and tostring(layer.Image or "") ~= ""
+        and V48_GetRainbowGradient(layer) ~= nil
+
+    if not valid then
+        if layer then pcall(function() layer:Destroy() end) end
+        local okClone, cloned = pcall(function() return sourceTemplate:Clone() end)
+        if not okClone or not cloned then
+            V48_DestroyRainbowLayer(slot)
+            return false, "rainbow-only-clone-failed"
+        end
+        layer = cloned
+        layer.Name = V48_LAYER_PREFIX .. tostring(slot)
+        layer.Parent = root
+        SpawnPetState.V48RainbowOnlyBySlot[slot] = layer
+    end
+
+    if not V48_ConfigureRainbowLayer(icon, layer, snapshot, slot) then
+        pcall(function() layer:Destroy() end)
+        SpawnPetState.V48RainbowOnlyBySlot[slot] = nil
+        return false, "rainbow-only-layer-configure-failed"
+    end
+
+    -- Critical requirement: ONLY the Rainbow layer is drawn in the Hotbar.
+    -- The game-owned base Icon remains in the slot but is invisible.
+    pcall(function()
+        -- Hide the exact visible icon we resolved above. Also hide any second
+        -- visible Icon-named image in the same slot so a template/wrapper
+        -- cannot leak the base pet artwork back on screen.
+        for _, node in ipairs(slot:GetDescendants()) do
+            if (node:IsA("ImageLabel") or node:IsA("ImageButton"))
+                and string.lower(tostring(node.Name or "")) == "icon"
+                and V49_IsGuiBranchVisible(node) then
+                node.ImageTransparency = 1
+                node.Visible = false
+            end
+        end
+        icon.Visible = false
+        icon.ImageTransparency = 1
+    end)
+
+    pcall(function()
+        slot:SetAttribute("__SpawnPetV49Visual", "RAINBOW-ONLY-FROM-CONTROL-PANEL")
+        slot:SetAttribute("__SpawnPetV49MutationSignature", expectedSig)
+        slot:SetAttribute("__SpawnPetV49RainbowLayer", "VISIBLE")
+    end)
+    return true, "rainbow-only-control-panel-layer"
+end
+
+-- SINGLE ACTIVE HOTBAR MUTATION RENDERER.
+function SpawnPet_HotbarRenderExactMutation(slot, meta)
+    if not slot or not slot.Parent then return false, "slot-missing" end
+    meta = meta or SpawnPetState.Meta or {}
+    local tool = V48_FindToolForSlot(slot)
+    local icon = SpawnPet_FindActualHotbarIcon(slot, tool)
+    if not (icon and (icon:IsA("ImageLabel") or icon:IsA("ImageButton"))) then
+        return false, "Icon-missing"
+    end
+
+    V48_ClearLegacyVisuals(slot)
+
+    if not V48_IsRainbow(meta) then
+        V48_DestroyRainbowLayer(slot)
+        return true, "no-rainbow"
+    end
+
+    local snapshot = nil
+    local tool = nil
+    snapshot, tool = V48_GetSnapshotForSlot(slot, meta)
+    if not snapshot then
+        pcall(function() slot:SetAttribute("__SpawnPetV49Visual", "ERROR:no-control-panel-rainbow-snapshot") end)
+        return false, "control-panel-rainbow-snapshot-missing"
+    end
+
+    SpawnPetState.ControlPanelVisualBySlot[slot] = snapshot
+    return V48_RenderRainbowOnly(slot, icon, meta, snapshot)
+end
+
+function SpawnPet_EnsureMutationHotbarVisual(slot, meta, iconId)
+    return SpawnPet_HotbarRenderExactMutation(slot, meta or {})
+end
+
+function SpawnPet_HotbarIsRainbow(meta)
+    return V48_IsRainbow(meta)
+end
+
+local function V48_RegisterToolMeta(tool, meta)
+    if not tool then return end
+    SpawnPetState.MetaByTool[tool] = meta
+end
+
+-- One watchdog: the native Icon stays hidden while the Rainbow-only sibling
+-- follows the Icon rectangle and is recreated after Hotbar repaints.
+function SpawnPet_StartHotbarMutationWatchdog(slot, tool, meta, iconId)
+    if not slot or not slot.Parent or not tool then return end
+
+    local old = SpawnPetState.V48Watchdogs[slot]
+    if old and old.connections then
+        for _, connection in ipairs(old.connections) do
+            pcall(function() connection:Disconnect() end)
+        end
+    end
+
+    V48_RegisterToolMeta(tool, meta)
+    local state = {slot=slot, tool=tool, meta=meta, iconId=iconId, connections={}}
+    SpawnPetState.V48Watchdogs[slot] = state
+
+    local function alive()
+        return slot.Parent ~= nil and tool.Parent ~= nil
+    end
+
+    local function ensure()
+        if not alive() then return end
+        state.meta = SpawnPetState.MetaByTool[tool] or state.meta or SpawnPetState.Meta or {}
+        pcall(function() SpawnPet_HotbarRenderExactMutation(slot, state.meta) end)
+    end
+
+    table.insert(state.connections, slot.DescendantAdded:Connect(function(child)
+        if child.Name == "Icon" then task.defer(ensure) end
+    end))
+    table.insert(state.connections, slot.DescendantRemoving:Connect(function(child)
+        if child.Name == "Icon" or child.Name == V48_LAYER_PREFIX .. tostring(slot) then
+            task.defer(ensure)
+        end
+    end))
+    table.insert(state.connections, slot.AncestryChanged:Connect(function(_, parent)
+        if not parent then
+            V48_DestroyRainbowLayer(slot)
+            local current = SpawnPetState.V48Watchdogs and SpawnPetState.V48Watchdogs[slot]
+            if current and current.connections then
+                for _, connection in ipairs(current.connections) do
+                    pcall(function() connection:Disconnect() end)
+                end
+            end
+            if SpawnPetState.V48Watchdogs then SpawnPetState.V48Watchdogs[slot] = nil end
+        end
+    end))
+
+    local accumulator = 0
+    table.insert(state.connections, RunService.RenderStepped:Connect(function(dt)
+        if not alive() then return end
+        accumulator += dt
+        if accumulator < 0.05 then return end
+        accumulator = 0
+
+        local currentMeta = SpawnPetState.MetaByTool[tool] or state.meta or SpawnPetState.Meta or {}
+        state.meta = currentMeta
+        local icon = SpawnPet_FindActualHotbarIcon(slot, tool)
+        if V48_IsRainbow(currentMeta) then
+            local layer = SpawnPetState.V48RainbowOnlyBySlot[slot]
+            if not layer or layer.Parent ~= V48_GetRoot() or V48_GetRainbowGradient(layer) == nil then
+                ensure()
+            elseif icon then
+                pcall(function()
+                    icon.Visible = false
+                    icon.ImageTransparency = 1
+                    local snapshot = SpawnPetState.ControlPanelVisualBySlot[slot] or SpawnPetState.ControlPanelVisualByTool[tool]
+                    if snapshot then
+                        V48_ConfigureRainbowLayer(icon, layer, snapshot, slot)
+                    else
+                        ensure()
+                    end
+                end)
+            else
+                ensure()
+            end
+        else
+            V48_DestroyRainbowLayer(slot)
+        end
+    end))
+
+    ensure()
+end
+
+-- Cleanup hook: remove Rainbow-only layer and then delegate to the existing
+-- legacy cleanup so the native Icon/tool state is restored normally.
+local V48_LegacyDestroy = SpawnPet_LegacyHotbarDestroyTopLevelReplica
+function SpawnPet_HotbarDestroyTopLevelReplica(slot, restoreIcon)
+    V48_DestroyRainbowLayer(slot)
+    local state = SpawnPetState.V48Watchdogs and SpawnPetState.V48Watchdogs[slot]
+    if state and state.connections then
+        for _, connection in ipairs(state.connections) do
+            pcall(function() connection:Disconnect() end)
+        end
+    end
+    if SpawnPetState.V48Watchdogs then SpawnPetState.V48Watchdogs[slot] = nil end
+    if V48_LegacyDestroy then
+        pcall(function() V48_LegacyDestroy(slot, restoreIcon) end)
+    end
+end
+
+local V48_LegacyRefill = SpawnPet_LegacyRefillReleasedHotbarSlots
+function SpawnPet_RefillReleasedHotbarSlots(releasedSlots, excludedTools)
+    if V48_LegacyRefill then
+        pcall(function() V48_LegacyRefill(releasedSlots, excludedTools) end)
+    end
+    for _, slot in ipairs(releasedSlots or {}) do
+        local tool = V48_FindToolForSlot(slot)
+        if tool then
+            local meta = SpawnPetState.MetaByTool[tool] or SpawnPetState.Meta or {}
+            V48_RegisterToolMeta(tool, meta)
+            pcall(function() SpawnPet_HotbarRenderExactMutation(slot, meta) end)
+        end
+    end
+end
+
+-- Repair already-bound virtual pet tools after the Rainbow-only renderer is installed.
+task.defer(function()
+    for tool, slot in pairs(SpawnPetState.ToolToSlot or {}) do
+        if tool and slot and tool.Parent and slot.Parent and tool:GetAttribute("VirtualPet") == true then
+            local meta = SpawnPetState.MetaByTool[tool] or SpawnPetState.Meta or {}
+            V48_RegisterToolMeta(tool, meta)
+            pcall(function() SpawnPet_HotbarRenderExactMutation(slot, meta) end)
+        end
+    end
+end)
+
+-- ============================================================
+-- V54: HOTBAR OVERFLOW -> NEW CLIENT-ONLY INVENTORY SLOT (VISIBLE REAL GRID)
+-- ============================================================
+-- User requirement:
+--   When Hotbar is full, create ONE additional pet slot in the real Bag grid,
+--   visually like a normal pet slot, but backed only by the existing client Tool.
+--   No server inventory mutation / RemoteEvent / RemoteFunction is performed.
+--
+-- Important V54 fixes over V53/V52:
+--   1) The new slot uses the SAME direct cell parent as a real pet cell.
+--   2) LayoutOrder is appended immediately after the real cells instead of
+--      forcing 100000, avoiding unexpected sorting/virtualized layouts.
+--   3) UIGridLayout.SortOrder is respected (LayoutOrder or Name).
+--   4) A client-only cell is tracked PER Tool, so repainting the Bag cannot
+--      duplicate or lose the slot.
+--   5) If the game's Grid is temporarily rebuilding, the previous client slot
+--      is kept alive until the real template/grid is discoverable again.
+--   6) The client-only Tool remains a normal LocalPlayer Backpack Tool; there is
+--      no server request to create, save or validate this pet.
+-- ============================================================
+
+SpawnPetState.V53InventoryCards = SpawnPetState.V53InventoryCards or {}
+SpawnPetState.V53InventoryToolByCard = SpawnPetState.V53InventoryToolByCard or setmetatable({}, {__mode="k"})
+SpawnPetState.V53InventoryRoot = SpawnPetState.V53InventoryRoot or nil
+SpawnPetState.V53InventoryCellParent = SpawnPetState.V53InventoryCellParent or nil
+SpawnPetState.V53InventoryGrid = SpawnPetState.V53InventoryGrid or nil
+SpawnPetState.V53InventoryTemplate = SpawnPetState.V53InventoryTemplate or nil
+SpawnPetState.V53InventoryConnections = SpawnPetState.V53InventoryConnections or {}
+SpawnPetState.V53InventoryRebuilding = false
+SpawnPetState.V53InventoryLastKey = SpawnPetState.V53InventoryLastKey or ""
+SpawnPetState.V53PetCountLabels = SpawnPetState.V53PetCountLabels or {}
+
+local V53_CELL_PREFIX = "__SpawnPetV53ClientOnlySlot_"
+local V53_VISUAL_NAME = "__SpawnPetV53ControlPanelPetVisual"
+
+local function V53_SafeDestroy(obj)
+    if obj then pcall(function() obj:Destroy() end) end
+end
+
+local function V53_Token(v)
+    local s = SpawnPet_Normalize(v)
+    s = string.lower(s)
+    return string.gsub(s, "[^%w]", "")
+end
+
+local function V53_IsRainbow(meta)
+    if not meta then return false end
+    if type(V48_IsRainbow) == "function" then
+        local ok, value = pcall(function() return V48_IsRainbow(meta) end)
+        if ok and value == true then return true end
+    end
+    if type(SpawnPet_HasMutationName) == "function" then
+        local ok, value = pcall(function() return SpawnPet_HasMutationName(meta, "Rainbow") end)
+        if ok and value == true then return true end
+    end
+    for _, mutation in ipairs(SpawnPet_V33MutationList(meta) or {}) do
+        if V53_Token(mutation) == "rainbow" then return true end
+    end
+    return V53_Token(meta.baseMutation) == "rainbow"
+end
+
+local function V53_MutationSignature(meta)
+    local keys = {}
+    for _, mutation in ipairs(SpawnPet_V33MutationList(meta or {}) or {}) do
+        local token = V53_Token(mutation)
+        if token ~= "" then keys[#keys + 1] = token end
+    end
+    table.sort(keys)
+    return table.concat(keys, "+")
+end
+
+local function V53_GetToolMeta(tool)
+    local meta = SpawnPetState.MetaByTool and SpawnPetState.MetaByTool[tool]
+    if type(meta) == "table" then return meta end
+
+    local mutations = {}
+    local raw = tool and tool:GetAttribute("PetMutations")
+    if raw then
+        for token in tostring(raw):gmatch("[^,]+") do
+            local clean = SpawnPet_Normalize(token)
+            if clean ~= "" then mutations[#mutations + 1] = clean end
+        end
+    end
+
+    return {
+        name = tostring(tool and (tool:GetAttribute("PetName") or tool.Name) or "Spawned Pet"),
+        rarity = tostring(tool and tool:GetAttribute("PetRarity") or ""),
+        perSecond = tostring(tool and (tool:GetAttribute("PetBPS") or tool:GetAttribute("PetPerSecond") or "") or ""),
+        image = tostring(tool and tool.TextureId or ""),
+        category = tostring(tool and tool:GetAttribute("PetCategory") or ""),
+        mutations = mutations,
+        baseMutation = tool and tool:GetAttribute("PetBaseMutation") or nil,
+        mutationOverride = tool and tool:GetAttribute("PetMutationOverride") or nil,
+        creatorTemporary = true,
+    }
+end
+
+local function V53_GetWeight(tool, meta)
+    local value = tool and tool:GetAttribute("PetWeight") or nil
+    value = SpawnPet_Normalize(value)
+    if value ~= "" then return value end
+    if meta and meta.weight then
+        local ok, formatted = pcall(function() return SpawnPet_FormatWeight(meta.weight) end)
+        if ok and SpawnPet_Normalize(formatted) ~= "" then return SpawnPet_Normalize(formatted) end
+    end
+    local source = SpawnPetState.ToolToClone and SpawnPetState.ToolToClone[tool]
+    if source and SpawnPet_FindWeightInInstance then
+        local ok, weight = pcall(function() return SpawnPet_FindWeightInInstance(source) end)
+        if ok and SpawnPet_Normalize(weight) ~= "" then return SpawnPet_Normalize(weight) end
+    end
+    return ""
+end
+
+local function V53_GetMutationText(meta)
+    local parts, seen = {}, {}
+    for _, mutation in ipairs(SpawnPet_V33MutationList(meta or {}) or {}) do
+        local clean = SpawnPet_Normalize(mutation)
+        local key = V53_Token(clean)
+        if clean ~= "" and key ~= "" and key ~= "none" and not seen[key] then
+            seen[key] = true
+            parts[#parts + 1] = clean
+        end
+    end
+    return table.concat(parts, " • ")
+end
+
+local function V53_FindInventory()
+    local pg = Player and Player:FindFirstChild("PlayerGui")
+    local bg = pg and pg:FindFirstChild("BackpackGui")
+    local backpack = bg and bg:FindFirstChild("Backpack")
+    local main = backpack and backpack:FindFirstChild("Main")
+    local inventory = main and main:FindFirstChild("Inventory")
+    if inventory and inventory:IsA("GuiObject") then return inventory end
+    return nil
+end
+
+local function V53_IsOurCell(obj)
+    if not obj then return false end
+    return obj:GetAttribute("__SpawnPetV53ClientOnlySlot") == true
+        or string.sub(tostring(obj.Name or ""), 1, #V53_CELL_PREFIX) == V53_CELL_PREFIX
+end
+
+local function V53_FindIcon(cell)
+    if not cell then return nil end
+    for _, name in ipairs({"PetIcon", "Icon", "ItemIcon", "PetImage", "Thumbnail", "Image"}) do
+        local node = cell:FindFirstChild(name, true)
+        if node and (node:IsA("ImageLabel") or node:IsA("ImageButton")) then return node end
+    end
+    local best, bestArea = nil, -1
+    for _, node in ipairs(cell:GetDescendants()) do
+        if (node:IsA("ImageLabel") or node:IsA("ImageButton")) then
+            local n = V53_Token(node.Name)
+            if n ~= "background" and not string.find(n, "background", 1, true) then
+                local size = node.AbsoluteSize
+                local area = math.max(1, size.X) * math.max(1, size.Y)
+                if size.X > 18 and size.Y > 18 and area > bestArea then
+                    best, bestArea = node, area
+                end
+            end
+        end
+    end
+    return best
+end
+
+local function V53_CellLooksReal(cell)
+    if not cell or not cell:IsA("GuiObject") or V53_IsOurCell(cell) then return false end
+    local icon = V53_FindIcon(cell)
+    if not icon then return false end
+    local size = cell.AbsoluteSize
+    return size.X >= 28 and size.Y >= 28
+end
+
+local function V53_FindTemplate(inventory)
+    if not inventory then return nil, nil, nil end
+
+    -- SOURCE-CONFIRMED REAL GAME STRUCTURE:
+    -- BackpackGui.Backpack.Main.Inventory.ScrollingFrame contains:
+    --   UIGridLayout
+    --   UIPadding
+    --   Template (TextButton, hidden)
+    --   numbered pet slots (0/1/2/.../n)
+    -- The Template is the exact object the game uses to create inventory slots.
+    -- Always prefer it instead of cloning an already-populated pet slot.
+    local directTemplate = inventory:FindFirstChild("Template")
+    local directGrid = inventory:FindFirstChildWhichIsA("UIGridLayout")
+    if directTemplate and directTemplate:IsA("GuiObject") then
+        return directTemplate, inventory, directGrid
+    end
+
+    -- Defensive fallback for a rebuilt UI where Template appears a moment later.
+    local best, bestParent, bestGrid, bestScore = nil, nil, nil, -math.huge
+
+    local function consider(cell)
+        if not V53_CellLooksReal(cell) then return end
+        local parent = cell.Parent
+        if not parent or not parent:IsA("GuiObject") then return end
+        local grid = parent:FindFirstChildWhichIsA("UIGridLayout")
+        local list = parent:FindFirstChildWhichIsA("UIListLayout")
+        local siblingCount = 0
+        for _, sibling in ipairs(parent:GetChildren()) do
+            if sibling:IsA("GuiObject") and not V53_IsOurCell(sibling) then siblingCount += 1 end
+        end
+        local size = cell.AbsoluteSize
+        local score = 0
+        if grid then score += 1000 end
+        if list then score += 100 end
+        if siblingCount >= 4 then score += 80 end
+        if size.X >= 45 and size.Y >= 45 then score += 20 end
+        if cell:FindFirstChildWhichIsA("UICorner", true) then score += 5 end
+        if cell:FindFirstChildWhichIsA("UIStroke", true) then score += 5 end
+        if cell:IsA("GuiButton") then score += 2 end
+        if score > bestScore then
+            bestScore, best, bestParent, bestGrid = score, cell, parent, grid
+        end
+    end
+
+    for _, node in ipairs(inventory:GetDescendants()) do
+        consider(node)
+    end
+    return best, bestParent, bestGrid
+end
+
+local function V53_SanitizeCell(card)
+    for _, node in ipairs(card:GetDescendants()) do
+        if node:IsA("Script") or node:IsA("LocalScript") or node:IsA("ModuleScript")
+            or node:IsA("RemoteEvent") or node:IsA("RemoteFunction")
+            or node:IsA("BindableEvent") or node:IsA("BindableFunction")
+            or node:IsA("ObjectValue") then
+            V53_SafeDestroy(node)
+        elseif node:IsA("GuiObject") then
+            pcall(function() node.Active = false end)
+        end
+    end
+end
+
+local function V53_CloneControlPanelVisual(card, targetIcon, snapshot, meta)
+    if not card or not targetIcon or not snapshot then return false end
+    local source = snapshot.fullControlPanelTree
+    if not source or not (source:IsA("ImageLabel") or source:IsA("ImageButton")) then
+        return false
+    end
+
+    local visual
+    local oldArchivable = source.Archivable
+    pcall(function() source.Archivable = true end)
+    local okClone = pcall(function() visual = source:Clone() end)
+    pcall(function() source.Archivable = oldArchivable end)
+    if not okClone or not visual then return false end
+
+    visual.Name = V53_VISUAL_NAME
+    visual.Parent = targetIcon.Parent
+    pcall(function()
+        visual.AnchorPoint = targetIcon.AnchorPoint
+        visual.Position = targetIcon.Position
+        visual.Size = targetIcon.Size
+        visual.Rotation = targetIcon.Rotation
+        visual.BackgroundTransparency = 1
+        visual.BorderSizePixel = 0
+        visual.Visible = true
+        visual.Active = false
+        visual.ClipsDescendants = false
+        visual.ZIndex = (tonumber(targetIcon.ZIndex) or 1) + 1
+    end)
+
+    local baseZ = tonumber(visual.ZIndex) or ((tonumber(targetIcon.ZIndex) or 1) + 1)
+    for _, node in ipairs(visual:GetDescendants()) do
+        if node:IsA("GuiObject") then
+            node.Visible = true
+            node.Active = false
+            node.ClipsDescendants = false
+            local token = V53_Token(node.Name)
+            if token == "rainbowoverlayimage" or string.find(token, "overlay", 1, true) or string.find(token, "mutation", 1, true) then
+                node.ZIndex = baseZ + 20
+            else
+                node.ZIndex = baseZ + 1
+            end
+        elseif node:IsA("UIGradient") then
+            pcall(function() node.Enabled = true end)
+        end
+    end
+
+    pcall(function()
+        targetIcon.Visible = false
+        targetIcon.ImageTransparency = 1
+    end)
+    return true
+end
+
+local function V53_UpdateCardText(card, tool, meta)
+    local nameText = tostring(meta.name or tool.Name or "Spawned Pet")
+    local rarityText = SpawnPet_Rarity(meta.rarity)
+    local rateText = SpawnPet_FormatRate(meta.perSecond)
+    local weightText = V53_GetWeight(tool, meta)
+    local mutationText = V53_GetMutationText(meta)
+
+    local names, weights, rarities, rates, mutations = {}, {}, {}, {}, {}
+    for _, node in ipairs(card:GetDescendants()) do
+        if node:IsA("TextLabel") or node:IsA("TextButton") or node:IsA("TextBox") then
+            local token = V53_Token(node.Name)
+            local current = string.lower(SpawnPet_Normalize(node.Text))
+            if string.find(token, "rarity", 1, true) then
+                table.insert(rarities, node)
+            elseif string.find(token, "persecond", 1, true) or string.find(token, "bps", 1, true) or string.find(token, "earning", 1, true) or string.find(token, "income", 1, true) or string.find(token, "rate", 1, true) then
+                table.insert(rates, node)
+            elseif string.find(token, "mutation", 1, true) then
+                table.insert(mutations, node)
+            elseif string.find(token, "weight", 1, true) or string.find(token, "kilogram", 1, true) or token == "kg" or string.find(current, "kg", 1, true) then
+                table.insert(weights, node)
+            elseif string.find(token, "toolname", 1, true) or string.find(token, "petname", 1, true) or string.find(token, "displayname", 1, true) or string.find(token, "itemname", 1, true) or token == "name" then
+                table.insert(names, node)
+            end
+        end
+    end
+
+    for _, node in ipairs(names) do pcall(function() node.Text = nameText end) end
+    for _, node in ipairs(weights) do if weightText ~= "" then pcall(function() node.Text = "(" .. weightText .. ")" end) end end
+    for _, node in ipairs(rarities) do if rarityText ~= "" then pcall(function() node.Text = rarityText end) end end
+    for _, node in ipairs(rates) do if rateText ~= "" then pcall(function() node.Text = rateText end) end end
+    for _, node in ipairs(mutations) do if mutationText ~= "" then pcall(function() node.Text = mutationText end) end end
+
+    -- If the real card does not expose a named field, add the missing field
+    -- INSIDE the new slot so it still behaves as one self-contained pet card.
+    local function addInfo(name, y, textValue, maxSize, textColor)
+        if SpawnPet_Normalize(textValue) == "" then return end
+        local label = Instance.new("TextLabel")
+        label.Name = name
+        label.BackgroundTransparency = 1
+        label.BorderSizePixel = 0
+        label.AnchorPoint = Vector2.new(0.5, 0.5)
+        label.Position = UDim2.new(0.5, 0, y, 0)
+        label.Size = UDim2.new(0.94, 0, 0.15, 0)
+        label.Text = textValue
+        label.TextColor3 = textColor
+        label.Font = Enum.Font.GothamBold
+        label.TextScaled = true
+        label.TextXAlignment = Enum.TextXAlignment.Center
+        label.TextYAlignment = Enum.TextYAlignment.Center
+        label.ZIndex = 5000
+        label.Active = false
+        label.Parent = card
+        local constraint = Instance.new("UITextSizeConstraint")
+        constraint.MinTextSize = 7
+        constraint.MaxTextSize = maxSize
+        constraint.Parent = label
+        local stroke = Instance.new("UIStroke")
+        stroke.Color = Color3.fromRGB(0,0,0)
+        stroke.Thickness = 1
+        stroke.Parent = label
+    end
+
+    if #names == 0 then addInfo("__SpawnPetV53Name", 0.84, nameText, 16, Color3.fromRGB(255,255,255)) end
+    if #weights == 0 and weightText ~= "" then addInfo("__SpawnPetV53Weight", 0.96, "(" .. weightText .. ")", 13, Color3.fromRGB(255,255,255)) end
+    if #mutations == 0 and mutationText ~= "" then addInfo("__SpawnPetV53Mutation", 0.10, mutationText, 12, Color3.fromRGB(255,240,90)) end
+    if #rarities == 0 and rarityText ~= "" then addInfo("__SpawnPetV53Rarity", 0.22, rarityText, 12, Color3.fromRGB(255,255,255)) end
+    if #rates == 0 and rateText ~= "" then addInfo("__SpawnPetV53Rate", 0.74, rateText, 11, Color3.fromRGB(144,255,80)) end
+end
+
+local function V53_GetNextLayoutOrder(parent)
+    local highest = -1
+    for _, child in ipairs(parent:GetChildren()) do
+        if child:IsA("GuiObject") and not V53_IsOurCell(child) then
+            highest = math.max(highest, tonumber(child.LayoutOrder) or -1)
+        end
+    end
+    return highest + 1
+end
+
+-- IMPORTANT VISIBILITY FIX:
+-- The real Inventory has 77+ cells, but the Bag opens scrolled to the top.
+-- Appending overflow to LayoutOrder 77+ puts it below the current viewport,
+-- making it appear as if no cell was created. Put the client pet immediately
+-- after the LAST REAL CELL CURRENTLY VISIBLE in the Bag viewport. This keeps
+-- it inside the actual UIGrid and makes the newly created slot visible without
+-- changing the game's own inventory data.
+local function V53_GetVisibleTailLayoutOrder(parent)
+    if not parent then return nil end
+    local px, py = parent.AbsolutePosition.X, parent.AbsolutePosition.Y
+    local pw, ph = parent.AbsoluteSize.X, parent.AbsoluteSize.Y
+    local right, bottom = px + pw, py + ph
+    local best = nil
+
+    for _, child in ipairs(parent:GetChildren()) do
+        if child:IsA("GuiObject") and not V53_IsOurCell(child) and child.Visible then
+            local x, y = child.AbsolutePosition.X, child.AbsolutePosition.Y
+            local w, h = child.AbsoluteSize.X, child.AbsoluteSize.Y
+            local intersects = (x < right and x + w > px and y < bottom and y + h > py)
+            if intersects then
+                local order = tonumber(child.LayoutOrder)
+                if order then
+                    best = best and math.max(best, order) or order
+                end
+            end
+        end
+    end
+    return best
+end
+
+local function V53_GetNextNameOrder(parent)
+    local highest = 0
+    for _, child in ipairs(parent:GetChildren()) do
+        if child:IsA("GuiObject") and not V53_IsOurCell(child) then
+            local n = tonumber(string.match(tostring(child.Name or ""), "(%d+)$"))
+            if n then highest = math.max(highest, n) end
+        end
+    end
+    return highest + 1
+end
+
+local function V53_CreateSlot(parent, template, grid, tool)
+    if not parent or not template or not tool then return nil end
+    local meta = V53_GetToolMeta(tool)
+
+    local oldArchivable = template.Archivable
+    local card
+    pcall(function() template.Archivable = true end)
+    local okClone = pcall(function() card = template:Clone() end)
+    pcall(function() template.Archivable = oldArchivable end)
+    if not okClone or not card then return nil end
+
+    local layoutOrder, nameOrder = 1, 1
+    if grid and grid.SortOrder == Enum.SortOrder.LayoutOrder then
+        layoutOrder = tonumber(tool:GetAttribute("__SpawnPetV53LayoutOrder")) or V53_GetNextLayoutOrder(parent)
+    else
+        nameOrder = tonumber(tool:GetAttribute("__SpawnPetV53NameOrder")) or V53_GetNextNameOrder(parent)
+    end
+    card.Name = V53_CELL_PREFIX .. string.format("%06d", nameOrder)
+    card:SetAttribute("__SpawnPetV53ClientOnlySlot", true)
+    card:SetAttribute("__SpawnPetV53NoServerMutation", true)
+    card:SetAttribute("__SpawnPetV53PetName", tostring(meta.name or tool.Name))
+    card:SetAttribute("__SpawnPetV53MutationSignature", V53_MutationSignature(meta))
+    SpawnPetState.V53InventoryToolByCard[card] = tool
+    card.LayoutOrder = layoutOrder
+    card.Visible = true
+    card.ClipsDescendants = false
+
+    V53_SanitizeCell(card)
+    card.Parent = parent
+
+    local targetIcon = V53_FindIcon(card)
+    local snapshot = nil
+    if SpawnPetState.ControlPanelVisualByTool then
+        snapshot = SpawnPetState.ControlPanelVisualByTool[tool]
+    end
+    if not snapshot or not snapshot.fullControlPanelTree then
+        local ok, result = pcall(function() return SpawnPet_CaptureControlPanelVisualForTool(tool, meta) end)
+        if ok then snapshot = result end
+    end
+
+    local shown = false
+    if targetIcon and snapshot and snapshot.fullControlPanelTree then
+        shown = V53_CloneControlPanelVisual(card, targetIcon, snapshot, meta)
+    end
+
+    if not shown then
+        if V53_IsRainbow(meta) then
+            V53_SafeDestroy(card)
+            return nil
+        end
+        if targetIcon then
+            pcall(function()
+                targetIcon.Image = tostring(meta.image or tool.TextureId or "")
+                targetIcon.ImageTransparency = 0
+                targetIcon.Visible = true
+                targetIcon.ScaleType = Enum.ScaleType.Fit
+            end)
+            shown = tostring(targetIcon.Image or "") ~= ""
+        end
+    end
+
+    if not shown then
+        V53_SafeDestroy(card)
+        return nil
+    end
+
+    V53_UpdateCardText(card, tool, meta)
+
+    local button = card:IsA("GuiButton") and card or card:FindFirstChildWhichIsA("GuiButton", true)
+    if button then
+        button.Active = true
+        button.AutoButtonColor = false
+        button.MouseButton1Click:Connect(function()
+            if not tool or not tool.Parent then
+                V53_SafeDestroy(card)
+                return
+            end
+            local free = SpawnPet_FindFreeHotbarSlot and SpawnPet_FindFreeHotbarSlot() or nil
+            if not free then
+                if SpawnPetState.Status then SpawnPetState.Status.Text = "HOTBAR FULL: " .. tostring(tool.Name) end
+                return
+            end
+            local currentMeta = V53_GetToolMeta(tool)
+            local ok, bound = pcall(function()
+                return SpawnPet_BindHotbarSlot(free, tool, currentMeta, currentMeta.image)
+            end)
+            if ok and bound then
+                tool:SetAttribute("VirtualPetInventoryOnly", false)
+                tool:SetAttribute("VirtualPetHotbarVisible", true)
+                V53_SafeDestroy(card)
+                if SpawnPetState.Status then SpawnPetState.Status.Text = "MOVED TO HOTBAR: " .. tostring(currentMeta.name or tool.Name) end
+                task.defer(function()
+                    SpawnPetState.V53InventoryLastKey = ""
+                end)
+            end
+        end)
+    end
+
+    return card
+end
+
+local function V53_OverflowTools()
+    local out, seen = {}, {}
+    for _, tool in ipairs(SpawnPetState.SpawnedTools or {}) do
+        if tool and tool:IsA("Tool") and tool.Parent
+            and tool:GetAttribute("VirtualPet") == true
+            and tool:GetAttribute("VirtualPetInventoryOnly") == true
+            and tool:GetAttribute("VirtualPetHotbarVisible") ~= true
+            and not seen[tool] then
+            seen[tool] = true
+            out[#out + 1] = tool
+        end
+    end
+    table.sort(out, function(a,b)
+        local ai = tonumber(a:GetAttribute("SpawnPetOrder")) or math.huge
+        local bi = tonumber(b:GetAttribute("SpawnPetOrder")) or math.huge
+        if ai ~= bi then return ai < bi end
+        return tostring(a.Name) < tostring(b.Name)
+    end)
+    return out
+end
+
+local function V53_UpdatePetCountLabels(inventory, overflowCount)
+    if not inventory then return end
+    local seen = {}
+    for _, node in ipairs(inventory:GetDescendants()) do
+        if node:IsA("TextLabel") or node:IsA("TextButton") then
+            local text = tostring(node.Text or "")
+            local current, max = text:match("[Pp]ets:%s*(%d+)%s*/%s*(%d+)")
+            if not SpawnPetState.V53PetCountLabels[node] then
+                local baseText = text
+                local baseCurrent, baseMax = text:match("[Pp]ets:%s*(%d+)%s*/%s*(%d+)")
+                if baseCurrent and baseMax then
+                    SpawnPetState.V53PetCountLabels[node] = {text = baseText, current = tonumber(baseCurrent), max = tonumber(baseMax)}
+                end
+            end
+            local saved = SpawnPetState.V53PetCountLabels[node]
+            if saved and saved.current and saved.max then
+                local newCount = saved.current + overflowCount
+                pcall(function() node.Text = "Pets: " .. tostring(newCount) .. "/" .. tostring(saved.max) end)
+                seen[node] = true
+            end
+        end
+    end
+    for node, saved in pairs(SpawnPetState.V53PetCountLabels) do
+        if node and node.Parent and not seen[node] and overflowCount == 0 then
+            pcall(function() node.Text = saved.text end)
+            SpawnPetState.V53PetCountLabels[node] = nil
+        end
+    end
+end
+
+local function V53_GetKey(inventory, parent, tools)
+    local pieces = {tostring(inventory), tostring(parent), tostring(#tools)}
+    for _, tool in ipairs(tools) do
+        local meta = V53_GetToolMeta(tool)
+        pieces[#pieces+1] = tostring(tool)
+        pieces[#pieces+1] = tostring(meta.name or tool.Name)
+        pieces[#pieces+1] = V53_MutationSignature(meta)
+    end
+    return table.concat(pieces, "|")
+end
+
+local function V53_ClearCards()
+    for _, cards in pairs(SpawnPetState.V53InventoryCards or {}) do
+        for _, card in ipairs(cards or {}) do V53_SafeDestroy(card) end
+    end
+    table.clear(SpawnPetState.V53InventoryCards)
+end
+
+local function V53_EnsureCanvas(parent, grid)
+    if not parent or not grid then return end
+    if parent:IsA("ScrollingFrame") and parent.AutomaticCanvasSize == Enum.AutomaticSize.None then
+        local content = grid.AbsoluteContentSize
+        local paddingX, paddingY = 12, 12
+        pcall(function()
+            parent.CanvasSize = UDim2.fromOffset(
+                math.max(parent.AbsoluteWindowSize.X, content.X + paddingX),
+                math.max(parent.AbsoluteWindowSize.Y, content.Y + paddingY)
+            )
+        end)
+    end
+end
+
+local function V53_Rebuild()
+    if SpawnPetState.V53InventoryRebuilding then return end
+    SpawnPetState.V53InventoryRebuilding = true
+
+    local ok, err = pcall(function()
+        local inventory = V53_FindInventory()
+        local tools = V53_OverflowTools()
+        local visible = inventory and inventory.Visible ~= false
+
+        if not inventory or not visible or #tools == 0 then
+            V53_ClearCards()
+            SpawnPetState.V53InventoryRoot = inventory
+            SpawnPetState.V53InventoryCellParent = nil
+            SpawnPetState.V53InventoryGrid = nil
+            SpawnPetState.V53InventoryTemplate = nil
+            SpawnPetState.V53InventoryLastKey = ""
+            V53_UpdatePetCountLabels(inventory, 0)
+            return
+        end
+
+        local template, parent, grid = V53_FindTemplate(inventory)
+        if not template or not parent then
+            -- Do not destroy existing client slots while the Bag is rebuilding.
+            V53_UpdatePetCountLabels(inventory, #tools)
+            return
+        end
+
+        local key = V53_GetKey(inventory, parent, tools)
+        local cards = SpawnPetState.V53InventoryCards.main
+        local sameParent = parent == SpawnPetState.V53InventoryCellParent
+        if key == SpawnPetState.V53InventoryLastKey and sameParent and type(cards) == "table" and #cards == #tools then
+            local alive = true
+            for _, card in ipairs(cards) do
+                if not card or card.Parent ~= parent then alive = false break end
+            end
+            if alive then
+                V53_EnsureCanvas(parent, grid)
+                V53_UpdatePetCountLabels(inventory, #tools)
+                return
+            end
+        end
+
+        -- Keep one and only one client slot for each overflow Tool.
+        V53_ClearCards()
+        SpawnPetState.V53InventoryLastKey = key
+        SpawnPetState.V53InventoryRoot = inventory
+        SpawnPetState.V53InventoryCellParent = parent
+        SpawnPetState.V53InventoryGrid = grid
+        SpawnPetState.V53InventoryTemplate = template
+
+        local newCards = {}
+        -- Prefer the visible tail so the first overflow pet is created in the
+        -- next grid position that the player can actually see when the Bag opens.
+        -- Fall back to the real end of the inventory when no real cell is visible.
+        local visibleTail = V53_GetVisibleTailLayoutOrder(parent)
+        local startingLayoutOrder = (visibleTail ~= nil) and (visibleTail + 1) or V53_GetNextLayoutOrder(parent)
+        local startingNameOrder = V53_GetNextNameOrder(parent)
+        for index, tool in ipairs(tools) do
+            pcall(function() tool:SetAttribute("__SpawnPetV53LayoutOrder", startingLayoutOrder + index - 1) end)
+            pcall(function() tool:SetAttribute("__SpawnPetV53NameOrder", startingNameOrder + index - 1) end)
+            pcall(function() tool:SetAttribute("__SpawnPetV54VisibleGridSlot", true) end)
+            local card = V53_CreateSlot(parent, template, grid, tool)
+            if card then newCards[#newCards + 1] = card end
+        end
+        SpawnPetState.V53InventoryCards.main = newCards
+
+        -- The game may use Name ordering instead of LayoutOrder. In that case
+        -- the V53 name is deliberately numeric/high enough to append after real
+        -- cells without disturbing their existing order.
+        -- The per-tool LayoutOrder was assigned before each slot was cloned, so
+        -- every client-only pet gets a unique real-grid position immediately.
+
+        V53_EnsureCanvas(parent, grid)
+        V53_UpdatePetCountLabels(inventory, #tools)
+    end)
+
+    SpawnPetState.V53InventoryRebuilding = false
+    if not ok then warn("[SpawnPet V53 Inventory] " .. tostring(err)) end
+end
+
+local function V53_BindInventory(inventory)
+    for _, connection in ipairs(SpawnPetState.V53InventoryConnections or {}) do
+        pcall(function() connection:Disconnect() end)
+    end
+    table.clear(SpawnPetState.V53InventoryConnections)
+    if not inventory then return end
+
+    table.insert(SpawnPetState.V53InventoryConnections, inventory:GetPropertyChangedSignal("Visible"):Connect(function()
+        SpawnPetState.V53InventoryLastKey = ""
+        task.defer(V53_Rebuild)
+    end))
+    table.insert(SpawnPetState.V53InventoryConnections, inventory.DescendantAdded:Connect(function()
+        SpawnPetState.V53InventoryLastKey = ""
+        task.defer(V53_Rebuild)
+    end))
+    table.insert(SpawnPetState.V53InventoryConnections, inventory.DescendantRemoving:Connect(function(child)
+        if not V53_IsOurCell(child) then
+            SpawnPetState.V53InventoryLastKey = ""
+            task.defer(V53_Rebuild)
+        end
+    end))
+end
+
+-- Re-discover the live Inventory subtree because the game's Bag UI can replace
+-- Main/Inventory entirely when the Bag is opened or its category changes.
+task.spawn(function()
+    while ScreenGui and ScreenGui.Parent do
+        task.wait(0.15)
+        pcall(function()
+            local inventory = V53_FindInventory()
+            if inventory ~= SpawnPetState.V53InventoryRoot then
+                V53_BindInventory(inventory)
+                SpawnPetState.V53InventoryLastKey = ""
+            end
+            V53_Rebuild()
+        end)
+    end
+end)
+
+task.defer(function()
+    task.wait(0.15)
+    local inventory = V53_FindInventory()
+    V53_BindInventory(inventory)
+    V53_Rebuild()
+end)
+
+-- End V54.
